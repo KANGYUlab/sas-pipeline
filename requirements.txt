@@ -1,0 +1,17 @@
+# SAS Pipeline Python Dependencies
+# Core dependencies for multi-technology sequencing analysis
+
+# Essential dependencies
+numpy>=1.16.0
+pandas>=1.0.0
+pysam>=0.15.0
+
+# Utility dependencies
+packaging>=20.0
+
+# Optional dependencies for enhanced functionality (install with: pip install sas-pipeline[viz])
+matplotlib>=3.1.0
+seaborn>=0.9.0
+plotly>=4.0.0
+
+

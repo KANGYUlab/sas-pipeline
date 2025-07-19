@@ -1,0 +1,29 @@
+{
+  "short_read_bam": "path/to/illumina.bam",
+  "hifi_bam": "path/to/hifi.bam",
+  "ont_bam": "path/to/ont.bam",
+  "reference_fa": "path/to/reference.fa",
+  "reference_fai": "path/to/reference.fa.fai",
+  "output_dir": "results",
+  "threads": 64,
+  "scripts_dir": "scripts",
+  "src_dir": "src",
+  "skip_filter": false,
+  "run_be_analysis": true,
+  "run_se_analysis": true,
+  "se_window_size": 2000,
+  "se_min_indel_length": 50,
+  "be_analysis_params": {
+    "min_coverage": 3,
+    "max_error_rate": 0.3,
+    "min_region_length": 50,
+    "max_region_length": 10000
+  },
+  "se_analysis_params": {
+    "terminal_region_size": 10000,
+    "depth_lower_bound_ratio": 0.2,
+    "depth_upper_bound_ratio": 2.0,
+    "indel_clip_threshold": 9,
+    "indel_clip_ratio": 0.6
+  }
+} 
