@@ -5,7 +5,7 @@
 
 ## Overview
 
-SAS (Sufficient Alignment Support) is a comprehensive toolkit for systematically evaluating genome assembly quality using multi-technology data integration. Unlike traditional methods that identify inconsistencies between assembly and aligned reads, SAS detects assembly errors by flagging erroneous windows without sufficient support from mapped reads. It combines short-read (Illumina), HiFi (PacBio), and ONT (Oxford Nanopore) sequencing data to identify and classify both Base-level Errors (BE) and Structural Errors (SE) with high sensitivity and accuracy.
+SAS (Sufficient Alignment Support) is a comprehensive toolkit for systematically evaluating genome assembly quality using multi-technology data integration. Unlike traditional methods that identify inconsistencies between assembly and aligned reads, SAS detects assembly errors by flagging erroneous windows without sufficient support from mapped reads. It combines short-read (Illumina/Element), HiFi (PacBio), and ONT (Oxford Nanopore) sequencing data to identify and classify both Base-level Errors (BE) and Structural Errors (SE) with high sensitivity and accuracy.
 
 The SAS algorithm employs a dual-approach strategy with technology-specific optimizations:
 - **BE (Base-level Errors)**: Detected in 50bp windows using high-precision reads from all platforms
@@ -20,10 +20,10 @@ The SAS algorithm employs a dual-approach strategy with technology-specific opti
 **Window Strategy**: 
 - **Window Size**: 50bp sliding windows across diploid assembly
 - **Support Threshold**: >10% of overall mean sequencing depth from any platform
-- **Data Sources**: High-precision reads from Illumina, HiFi, and ONT platforms
+- **Data Sources**: Reads from Illumina/Element, HiFi, and ONT platforms
 
 **Adaptive Thresholds for Special Regions**:
-The support threshold is relaxed to >10% of local depth in challenging regions where high-accuracy platforms show bias:
+The support threshold is relaxed to >10% of local depth in challenging regions devoid of reads from high-accuracy platforms:
 
 1. **Telomeric Regions**: Within 10kb of chromosomal ends
 2. **Degenerative Repeats**: GnA or CnT repeats where GA/CT% ≥90% and GC% ≥60%
@@ -48,7 +48,7 @@ The support threshold is relaxed to >10% of local depth in challenging regions w
 
 **Position-Aware Analysis**:
 - **Internal Regions**: Apply both depth-based and event-based criteria ( >50% of window reads)
-- **Terminal Regions** (±10kb from chromosome ends): Relaxed criteria accounting for telomeric complexity, focus on event-based detection
+- **Terminal Regions** (within 10kb from chromosome ends): Relaxed criteria accounting for telomeric complexity, focus on event-based detection
 
 **Key Features**:
 - Multi-window allocation for spanning events
