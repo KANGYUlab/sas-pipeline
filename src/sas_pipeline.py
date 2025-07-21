@@ -361,7 +361,9 @@ class SASPipeline:
             "--output-dir", str(self.se_output_dir),
             "--window-size", str(self.se_window_size),
             "--min-indel-length", str(self.se_min_indel_length),
-            "--threads", str(self.threads)
+            "--threads", str(self.threads),
+            "--spanning-window-size", "30000",
+            "--spanning-step-size", "2000"
         ]
         self._run_command(cmd, "Running SE analysis with filtered ONT data")
         
@@ -373,7 +375,7 @@ class SASPipeline:
     def step4_generate_summary(self):
         """Step 4: Generate comprehensive summary report"""
         self.logger.info("="*50)
-        self.logger.info("STEP 4: Generating Summary Report")
+        self.logger.info("STEP 4: Generating Summary Report") 
         self.logger.info("="*50)
         
         summary_file = self.output_dir / "sas_pipeline_summary.txt"
