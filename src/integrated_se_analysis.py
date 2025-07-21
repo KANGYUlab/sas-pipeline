@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Integrated Structural Error Analysis Tool
+Integrated Structural Error Analysis Tool with Spanning Reads Detection
 
-This script integrates clip, indel, and depth analysis to identify anomalous regions
+This script integrates clip, indel, depth and spanning reads analysis to identify anomalous regions
 in BAM files using sliding windows with customizable thresholds.
 
 Features:
-- Analyzes clips, indels, and depth in a unified framework
+- Analyzes clips, indels, depth and spanning reads in a unified framework
 - Identifies anomalous regions based on configurable criteria
 - Special handling for chromosome terminal regions (10kb)
 - Multi-threaded processing for performance
+- Spanning reads analysis with custom window generation and merging
 
 Anomaly Detection Criteria:
 1. Non-terminal regions (outside first/last 10kb):
    - Depth anomalies: < 20% or > 200% of mean depth
    - INDEL/Clip anomalies: ReadsWithInsertion/ReadsWithDeletion/ClipCount ratio > 0.5
+   - Non-spanning: Regions without spanning reads
    - Note: Uses reads containing INDELs, not INDEL event counts
 2. Terminal regions (first/last 10kb):
    - NO depth anomaly detection (depth variations ignored)
@@ -28,10 +30,11 @@ Requirements:
     - numpy
     - pandas
     - mosdepth (external tool)
+    - bedtools (for merging)
     - Python 3.6+
 
 Usage:
-    python integrated_sv_analysis.py input.bam reference.fa output_prefix [options]
+    python integrated_se_analysis.py input.bam reference.fa output_prefix [options]
 """
 
 import sys
@@ -45,10 +48,94 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Dict, Tuple, Set, List, DefaultDict, Optional
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import multiprocessing
 import numpy as np
 import pandas as pd
 import pysam
+
+
+# ===== SPANNING READS ANALYSIS FUNCTIONS =====
+
+def call_spanning_analysis(bam_file_path, fai_file, output_prefix, spanning_window_size=30000, spanning_step_size=2000, threads=multiprocessing.cpu_count()):
+    """Call spanning.py script to perform spanning reads analysis"""
+    
+    # Build spanning.py script path
+    script_dir = Path(__file__).parent.parent / "scripts"  
+    spanning_script = script_dir / "spanning.py"
+    
+    if not spanning_script.exists():
+        print(f"Error: spanning.py script not found at {spanning_script}", file=sys.stderr)
+        return []
+    
+    # Build command
+    cmd = [
+        "python3",
+        str(spanning_script),
+        bam_file_path,
+        fai_file,
+        "--window-size", str(spanning_window_size),
+        "--step-size", str(spanning_step_size),
+        "--output", output_prefix,
+        "--processes", str(threads),
+        "--merge",
+        "--bed"
+    ]
+    
+    try:
+        print(f"Running spanning reads analysis...", file=sys.stderr)
+        print(f"Command: {' '.join(cmd)}", file=sys.stderr)
+        
+        # Run spanning analysis script
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        
+        # Print script's stderr output (contains progress information)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        
+        # Read non-spanning regions results
+        non_spanning_bed = f"{output_prefix}.non_spanning.bed"
+        non_spanning_regions = []
+        
+        if os.path.exists(non_spanning_bed):
+            with open(non_spanning_bed, 'r') as f:
+                for line in f:
+                    if line.startswith('#') or line.startswith('chromosome'):
+                        continue  # Skip comments and headers
+                    fields = line.strip().split('\t')
+                    if len(fields) >= 3:
+                        chrom, start, end = fields[0], int(fields[1]), int(fields[2])
+                        non_spanning_regions.append((chrom, start, end))
+            
+            print(f"Loaded {len(non_spanning_regions)} non-spanning regions from {non_spanning_bed}", file=sys.stderr)
+        
+        return non_spanning_regions
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error running spanning analysis: {e}", file=sys.stderr)
+        if e.stderr:
+            print(f"Error output: {e.stderr}", file=sys.stderr)
+        return []
+    except Exception as e:
+        print(f"Unexpected error in spanning analysis: {e}", file=sys.stderr)
+        return []
+
+def assign_spanning_to_windows(merged_spanning_regions, window_size=2000):
+    """Assign merged spanning regions to 2k windows"""
+    spanning_windows = set()
+    
+    for chrom, start, end in merged_spanning_regions:
+        # Calculate all 2k windows covered by this region
+        start_window = (start // window_size) * window_size
+        end_window = ((end - 1) // window_size) * window_size
+        
+        # Add all covered windows
+        for window_start in range(start_window, end_window + window_size, window_size):
+            spanning_windows.add((chrom, window_start))
+    
+    return spanning_windows
+
+# ===== ORIGINAL SE ANALYSIS CLASSES AND FUNCTIONS =====
 
 
 class IntegratedSECounters:
@@ -78,7 +165,8 @@ class IntegratedSECounters:
                     'ReadsWithClip': 0,
                     'TotalReads': 0,
                     'ReadsWithoutINDELorClip': 0,
-                    'Depth': 0.0
+                    'Depth': 0.0,
+                    'HasSpanningReads': True  # New spanning reads flag
                 }
     
     def update_windows(self, local_windows: Dict[Tuple[str, int], Dict[str, int]]):
@@ -89,7 +177,18 @@ class IntegratedSECounters:
             for window_key, counts in local_windows.items():
                 if window_key in self.windows:
                     for count_type, count_value in counts.items():
-                        self.windows[window_key][count_type] += count_value
+                        if count_type == 'HasSpanningReads':
+                            # For boolean values, use AND logic
+                            self.windows[window_key][count_type] = self.windows[window_key][count_type] and count_value
+                        else:
+                            self.windows[window_key][count_type] += count_value
+    
+    def mark_non_spanning_windows(self, non_spanning_windows: Set[Tuple[str, int]]):
+        """Mark windows without spanning reads"""
+        with self.lock:
+            for window_key in non_spanning_windows:
+                if window_key in self.windows:
+                    self.windows[window_key]['HasSpanningReads'] = False
 
 
 def get_chromosome_lengths_from_bam(bam: pysam.AlignmentFile) -> Dict[str, int]:
@@ -437,7 +536,7 @@ def identify_anomalous_regions(
     terminal_region_size: int = 10000
 ) -> List[Dict]:
     """
-    Identify anomalous regions based on the integrated criteria.
+    Identify anomalous regions based on the integrated criteria including spanning reads.
     """
     anomalous_regions = []
     
@@ -472,17 +571,20 @@ def identify_anomalous_regions(
                      (window_start >= chrom_length - terminal_region_size)
         
         anomaly_reasons = []
+        anomaly_tags = []  # Store anomaly type tags
         
         # Check anomalies based on region type
         if not is_terminal:
-            # NON-TERMINAL REGIONS: Check both depth and INDEL/clip anomalies
+            # NON-TERMINAL REGIONS: Check depth, INDEL/clip and spanning anomalies
             
             # 1. Check depth anomalies
             if local_depth > 0:
                 if local_depth < depth_lower_bound:
                     anomaly_reasons.append(f"Low depth ({local_depth:.2f} < {depth_lower_bound:.2f})")
+                    anomaly_tags.append("low_depth")
                 elif local_depth > depth_upper_bound:
                     anomaly_reasons.append(f"High depth ({local_depth:.2f} > {depth_upper_bound:.2f})")
+                    anomaly_tags.append("high_depth")
             
             # 2. Check INDEL and clip anomalies
             total_reads = counts['TotalReads']
@@ -491,16 +593,25 @@ def identify_anomalous_regions(
             clip_count = counts['ClipCount']
             if total_reads > 0 and (clip_count / total_reads) > 0.5:
                 anomaly_reasons.append(f"High clip ratio ({clip_count}/{total_reads} = {clip_count/total_reads:.3f})")
+                anomaly_tags.append("clip")
             
             # Check insertions (use reads with insertions, not insertion count)
             insertion_reads = counts['ReadsWithInsertion']
             if total_reads > 0 and (insertion_reads / total_reads) > 0.5:
                 anomaly_reasons.append(f"High insertion reads ratio ({insertion_reads}/{total_reads} = {insertion_reads/total_reads:.3f})")
+                anomaly_tags.append("indel")
             
             # Check deletions (use reads with deletions, not deletion count)
             deletion_reads = counts['ReadsWithDeletion']
             if total_reads > 0 and (deletion_reads / total_reads) > 0.5:
                 anomaly_reasons.append(f"High deletion reads ratio ({deletion_reads}/{total_reads} = {deletion_reads/total_reads:.3f})")
+                anomaly_tags.append("indel")
+            
+            # 3. Check spanning reads
+            has_spanning = counts.get('HasSpanningReads', True)
+            if not has_spanning:
+                anomaly_reasons.append("No spanning reads")
+                anomaly_tags.append("non_spanning")
         
         else:
             # TERMINAL REGIONS (first/last 10kb): Only check reads without INDEL/clip, NO depth anomaly detection
@@ -512,6 +623,11 @@ def identify_anomalous_regions(
                 ratio = reads_without_indel_clip / total_reads
                 if reads_without_indel_clip < 1 or ratio <= 0.1:
                     anomaly_reasons.append(f"Terminal region anomaly: reads without INDEL/clip ({reads_without_indel_clip}/{total_reads} = {ratio:.3f}) is too low")
+                    # For terminal regions, classify based on INDEL or clip status
+                    if counts['Insertion'] > 0 or counts['Deletion'] > 0:
+                        anomaly_tags.append("indel")
+                    else:
+                        anomaly_tags.append("clip")
         
         # If any anomalies were found, add this region
         if anomaly_reasons:
@@ -527,7 +643,9 @@ def identify_anomalous_regions(
                 'deletion_count': counts['Deletion'],
                 'reads_without_indel_clip': counts['ReadsWithoutINDELorClip'],
                 'total_reads': counts['TotalReads'],
+                'has_spanning_reads': counts.get('HasSpanningReads', True),
                 'anomaly_reasons': '; '.join(anomaly_reasons),
+                'anomaly_tags': ','.join(anomaly_tags),  # New tags field
                 'error_type': error_type
             })
     
@@ -567,45 +685,6 @@ def terminal_reads_analysis(
     return terminal_type_counts, total_indel, total_clip
 
 
-def save_anomaly_summary(anomalous_regions, chrom_lengths, output_prefix, terminal_type_counts=None):
-    from collections import defaultdict
-    summary = defaultdict(lambda: defaultdict(int))
-    for region in anomalous_regions:
-        etype = region['error_type']
-        chrom = region['chromosome']
-        if etype in ("low_depth", "high_depth", "indel", "clip"):
-            summary[chrom][etype] += 1
-    if terminal_type_counts is None:
-        terminal_type_counts = defaultdict(lambda: {'indel': 0, 'clip': 0})
-    all_chroms = sorted(chrom_lengths.keys())
-    summary_file = f"{output_prefix}.anomaly_summary.tsv"
-    with open(summary_file, 'w') as f:
-        f.write("Chromosome\tlow_depth\thigh_depth\tindel\tclip\tterminal_indel\tterminal_clip\n")
-        total_row = ["Total", 0, 0, 0, 0, 0, 0]
-        for chrom in all_chroms:
-            row = [chrom]
-            indel_val = summary[chrom]["indel"]
-            clip_val = summary[chrom]["clip"]
-            t_indel = terminal_type_counts[chrom]["indel"]
-            t_clip = terminal_type_counts[chrom]["clip"]
-            row.append(str(summary[chrom]["low_depth"]))
-            row.append(str(summary[chrom]["high_depth"]))
-            row.append(str(indel_val + t_indel))
-            row.append(str(clip_val + t_clip))
-            row.append(str(t_indel))
-            row.append(str(t_clip))
-            total_row[1] += summary[chrom]["low_depth"]
-            total_row[2] += summary[chrom]["high_depth"]
-            total_row[3] += indel_val + t_indel
-            total_row[4] += clip_val + t_clip
-            total_row[5] += t_indel
-            total_row[6] += t_clip
-            f.write("\t".join(row) + "\n")
-        total_row = [str(x) for x in total_row]
-        f.write("\t".join(total_row) + "\n")
-    print(f"Anomaly summary saved to: {summary_file}")
-
-
 def save_results(
     windows: Dict[Tuple[str, int], Dict[str, int]], 
     depth_data: Dict[Tuple[str, int], float],
@@ -623,7 +702,7 @@ def save_results(
     with open(stats_file, 'w') as f:
         f.write("Chromosome\tStart\tEnd\tDepth\tClipCount\tInsertion\tDeletion\t"
                 "ReadsWithInsertion\tReadsWithDeletion\tReadsWithClip\t"
-                "TotalReads\tReadsWithoutINDELorClip\n")
+                "TotalReads\tReadsWithoutINDELorClip\tHasSpanningReads\n")
         
         for (chrom, window_start), counts in sorted(windows.items()):
             chrom_length = chrom_lengths.get(chrom, window_start + window_size)
@@ -634,29 +713,84 @@ def save_results(
                 reads_without_indel_clip = str(counts['ReadsWithoutINDELorClip'])
             else:
                 reads_without_indel_clip = '-'
+            has_spanning = counts.get('HasSpanningReads', True)
             f.write(f"{chrom}\t{window_start + 1}\t{window_end}\t{depth:.4f}\t"
                    f"{counts['ClipCount']}\t{counts['Insertion']}\t{counts['Deletion']}\t"
                    f"{counts['ReadsWithInsertion']}\t{counts['ReadsWithDeletion']}\t"
                    f"{counts['ReadsWithClip']}\t{counts['TotalReads']}\t"
-                   f"{reads_without_indel_clip}\n")
-    
+                   f"{reads_without_indel_clip}\t{has_spanning}\n")
     print(f"Window statistics saved to: {stats_file}")
     
-    # Save anomalous regions
+    # Save anomalous regions (no ErrorType column)
     anomalies_file = f"{output_prefix}.anomalous_regions.tsv"
     with open(anomalies_file, 'w') as f:
         f.write("Chromosome\tStart\tEnd\tIsTerminal\tDepth\tClipCount\t"
                 "InsertionCount\tDeletionCount\tReadsWithoutINDELClip\t"
-                "TotalReads\tAnomalyReasons\tErrorType\n")
-        
+                "TotalReads\tHasSpanningReads\tAnomalyTags\tAnomalyReasons\n")
         for region in anomalous_regions:
             f.write(f"{region['chromosome']}\t{region['start']}\t{region['end']}\t"
                    f"{region['is_terminal']}\t{region['depth']:.4f}\t"
                    f"{region['clip_count']}\t{region['insertion_count']}\t"
                    f"{region['deletion_count']}\t{region['reads_without_indel_clip']}\t"
-                   f"{region['total_reads']}\t{region['anomaly_reasons']}\t{region['error_type']}\n")
-    
+                   f"{region['total_reads']}\t{region['has_spanning_reads']}\t"
+                   f"{region['anomaly_tags']}\t{region['anomaly_reasons']}\n")
     print(f"Anomalous regions saved to: {anomalies_file}")
+
+# 只保留se.non_spanning.bed，不再生成se.spanning_regions.merged.bed
+# se.result.bed: anomalous_regions.tsv前三列，start-1，merge
+
+def generate_se_result_bed(anomalous_regions_file, output_bed):
+    """Generate se.result.bed by merging se.anomalous_regions.tsv (chr, start-1, end) with bedtools merge."""
+    import os
+    bed_tmp = output_bed + ".tmp.bed"
+    with open(anomalous_regions_file, 'r') as fin, open(bed_tmp, 'w') as fout:
+        next(fin)  # skip header
+        for line in fin:
+            fields = line.strip().split('\t')
+            if len(fields) >= 3:
+                start = max(0, int(fields[1]) - 1)
+                fout.write(f"{fields[0]}\t{start}\t{fields[2]}\n")
+    # Run bedtools merge
+    cmd = ["bedtools", "merge", "-i", bed_tmp]
+    with open(output_bed, 'w') as fout:
+        subprocess.run(cmd, stdout=fout, check=True)
+    os.remove(bed_tmp)
+    print(f"Merged SE result BED saved to: {output_bed}")
+
+# save_anomaly_summary: spanning列改为non-spanning
+
+def save_anomaly_summary(anomalous_regions, chrom_lengths, output_prefix):
+    from collections import defaultdict
+    summary = defaultdict(lambda: defaultdict(int))
+    nr_se = defaultdict(int)
+    tag_types = ["low_depth", "high_depth", "indel", "clip", "non_spanning"]
+    for region in anomalous_regions:
+        chrom = region['chromosome']
+        tags = [t.strip() for t in region['anomaly_tags'].split(',')] if region['anomaly_tags'] else []
+        for tag in tag_types:
+            if tag in tags:
+                summary[chrom][tag] += 1
+        nr_se[chrom] += 1
+    all_chroms = sorted(chrom_lengths.keys())
+    summary_file = f"{output_prefix}.anomaly_summary.tsv"
+    with open(summary_file, 'w') as f:
+        f.write("Chromosome\tlow_depth\thigh_depth\tindel\tclip\tnon-spanning\tnr-SE\n")
+        total_row = ["Total", 0, 0, 0, 0, 0, 0]
+        for chrom in all_chroms:
+            row = [chrom]
+            row.append(str(summary[chrom]["low_depth"]))
+            row.append(str(summary[chrom]["high_depth"]))
+            row.append(str(summary[chrom]["indel"]))
+            row.append(str(summary[chrom]["clip"]))
+            row.append(str(summary[chrom]["non_spanning"]))
+            row.append(str(nr_se[chrom]))
+            for i in range(1, 6):
+                total_row[i] += int(row[i])
+            total_row[6] += int(row[6])
+            f.write("\t".join(row) + "\n")
+        total_row = [str(x) for x in total_row]
+        f.write("\t".join(total_row) + "\n")
+    print(f"Anomaly summary saved to: {summary_file}")
 
 
 def main():
@@ -689,6 +823,10 @@ Examples:
                        help="Number of threads to use (default: 4)")
     parser.add_argument("--terminal-region-size", type=int, default=10000,
                        help="Size of terminal regions for special analysis (default: 10000)")
+    parser.add_argument("--spanning-window-size", type=int, default=30000,
+                       help="Window size for spanning reads analysis (default: 30000)")
+    parser.add_argument("--spanning-step-size", type=int, default=2000,
+                       help="Step size for spanning reads analysis (default: 2000)")
     parser.add_argument("--version", action="version", version="%(prog)s 1.0")
     
     args = parser.parse_args()
@@ -701,7 +839,9 @@ Examples:
         sys.exit(1)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    full_output_prefix = output_dir / args.output_prefix
+    # 强制前缀为se
+    output_prefix = 'se'
+    full_output_prefix = os.path.join(args.output_dir, output_prefix)
     try:
         print(f"Starting integrated SE analysis for: {args.bam_file}")
         print(f"Reference: {args.reference_fa}")
@@ -760,6 +900,42 @@ Examples:
                     print(f"Completed chromosome {chrom} ({completed_chroms}/{len(chrom_lengths)})")
                 except Exception as e:
                     print(f"Error processing chromosome {chrom}: {e}", file=sys.stderr)
+        
+        print("\n" + "="*50)
+        print("STEP 5: Analyzing spanning reads")
+        print("="*50)
+        
+        # Generate FAI file if it doesn't exist
+        fai_file = args.reference_fa + '.fai'
+        if not os.path.exists(fai_file):
+            print(f"Generating index for reference file: {args.reference_fa}")
+            try:
+                subprocess.run(['samtools', 'faidx', args.reference_fa], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Error generating fai file: {e}", file=sys.stderr)
+                sys.exit(1)
+        
+        # Call the spanning analysis script
+        no_spanning_regions = call_spanning_analysis(
+            args.bam_file,
+            fai_file,
+            str(full_output_prefix),
+            args.spanning_window_size,
+            args.spanning_step_size,
+            args.threads
+        )
+        print(f"Loaded {len(no_spanning_regions)} non-spanning regions from script output")
+        
+                 # Note: spanning.py script has already handled terminal regions and merge
+         # So we can directly use the returned regions here
+        
+        # Assign merged spanning regions to 2k windows  
+        non_spanning_windows = assign_spanning_to_windows(no_spanning_regions, args.window_size)
+        print(f"Assigned {len(non_spanning_windows)} non-spanning windows")
+        
+        # Mark non-spanning windows in global counters
+        global_counters.mark_non_spanning_windows(non_spanning_windows)
+        
         print("\n" + "="*50)
         print("STEP 6: Integrating depth data")
         print("="*50)
@@ -789,17 +965,17 @@ Examples:
             args.window_size,
             args.terminal_region_size
         )
-        terminal_type_counts, _, _ = terminal_reads_analysis(
-            global_counters.windows,
-            depth_data,
-            chrom_lengths,
-            args.terminal_region_size
-        )
+
+        # 生成se.result.bed
+        anomalies_file = os.path.join(args.output_dir, "se.anomalous_regions.tsv")
+        merge_bed_file = os.path.join(args.output_dir, "se.result.bed")
+        generate_se_result_bed(anomalies_file, merge_bed_file)
+
+        # 保存summary
         save_anomaly_summary(
             anomalous_regions,
             chrom_lengths,
-            str(full_output_prefix),
-            terminal_type_counts
+            str(full_output_prefix)
         )
         print("\n" + "="*50)
         print("ANALYSIS COMPLETE")
