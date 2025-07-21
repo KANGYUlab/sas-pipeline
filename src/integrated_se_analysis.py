@@ -736,7 +736,6 @@ def save_results(
                    f"{region['anomaly_tags']}\t{region['anomaly_reasons']}\n")
     print(f"Anomalous regions saved to: {anomalies_file}")
 
-# 只保留se.non_spanning.bed，不再生成se.spanning_regions.merged.bed
 # se.result.bed: anomalous_regions.tsv前三列，start-1，merge
 
 def generate_se_result_bed(anomalous_regions_file, output_bed):
@@ -839,7 +838,6 @@ Examples:
         sys.exit(1)
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    # 强制前缀为se
     output_prefix = 'se'
     full_output_prefix = os.path.join(args.output_dir, output_prefix)
     try:
@@ -966,12 +964,11 @@ Examples:
             args.terminal_region_size
         )
 
-        # 生成se.result.bed
+
         anomalies_file = os.path.join(args.output_dir, "se.anomalous_regions.tsv")
         merge_bed_file = os.path.join(args.output_dir, "se.result.bed")
         generate_se_result_bed(anomalies_file, merge_bed_file)
 
-        # 保存summary
         save_anomaly_summary(
             anomalous_regions,
             chrom_lengths,
