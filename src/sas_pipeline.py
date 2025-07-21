@@ -421,7 +421,7 @@ class SASPipeline:
         se_results = {}
         total_se_errors = 0
         if self.run_se_analysis:
-            se_anomalies_file = self.se_output_dir / "structural_errors.anomalous_regions.tsv"
+            se_anomalies_file = self.se_output_dir / "se.anomalous_regions.tsv"
             se_count = count_lines(se_anomalies_file) - 1 if se_anomalies_file.exists() else 0  # Exclude header
             se_results = {
                 'anomalous_regions_count': se_count
@@ -484,7 +484,7 @@ class SASPipeline:
             
             if self.run_se_analysis:
                 f.write(f"  SE Analysis Results: {self.se_output_dir}\n")
-                f.write(f"  SE anomalous regions: {self.se_output_dir}/structural_errors.anomalous_regions.tsv\n")
+                f.write(f"  SE anomalous regions: {self.se_output_dir}/se.anomalous_regions.tsv\n")
             
             f.write("\nResults Statistics:\n")
             
