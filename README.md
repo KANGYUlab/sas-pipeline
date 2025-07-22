@@ -57,13 +57,13 @@ The support threshold is relaxed to >10% of local depth in challenging regions w
 
 ##### Non-spanning Reads Detection
 
-- **Purpose:** Identify 2kb windows where no ONT read fully spans the window, indicating possible assembly gaps or misjoins.
-- **Method:** For each 2kb window, check if any ONT read covers the entire window (default: 30kb window, 2kb step; last window always covers chromosome end, length 28-30kb)。
+- For each 2kb step window, check whether any ONT read fully spans a 30kb window starting at that position (the last window always covers the chromosome end, with length 28-30kb). If no spanning read is found, the region is considered non-spanning.
 
-- **BED file:** All merged non-spanning regions are output as `se.non_spanning.bed` (0-based, BED format).
+- **Terminal correction:** After merging, if a region starts at the chromosome beginning, the last 28kb is removed; if a region ends at the chromosome end, the first 28kb is removed. This ensures only valid internal non-spanning regions are reported and avoids false positives at chromosome boundaries.
 
+- **BED file:** All merged and terminal-corrected non-spanning regions are output as `se.non_spanning_regions.merged.bed` (0-based, BED format).
 
-- **Output:** Windows without spanning reads are tagged as `non_spanning` in the anomaly files and summarized in the `non-spanning` column of `se.anomaly_summary.tsv`.
+- **Output:** Windows overlapping these merged regions are tagged as `non_spanning` in the anomaly files and summarized in the `non-spanning` column of `se.anomaly_summary.tsv`.
 ### Quality Value Calculation
 
 The final assembly quality is quantified using the Phred-scaled Quality Value:
@@ -268,48 +268,19 @@ results/
 │   ├── ont_filtered_regions.txt     # ONT cross-validation results
 │   └── merged_results.txt           # Multi-technology consensus results
 ├── se_analysis/                      # SE (Structural Errors) analysis results
-│   ├── structural_errors.anomalous_regions.tsv    # Detected structural anomalies
-│   ├── structural_errors.window_stats.tsv         # Window-based statistics
-│   └── structural_errors.anomaly_summary.tsv      # Summary of anomaly types
+│   ├── se.anomalous_regions.bed           # All anomalous regions (BED)
+│   ├── se.anomalous_regions.tsv           # All anomalous regions (table)
+│   ├── se.anomaly_summary.tsv             # Per-chromosome anomaly summary
+│   ├── se.mosdepth.global.dist.txt        # Global depth distribution
+│   ├── se.mosdepth.region.dist.txt        # Per-region depth distribution
+│   ├── se.mosdepth.summary.txt            # Depth summary statistics
+│   ├── se.non_spanning.bed                # All 2kb non-spanning windows
+│   ├── se.non_spanning_regions.merged.bed # Merged non-spanning regions (BED)
+│   ├── se.regions.bed.gz                  # All 2kb windows (gzipped BED)
+│   ├── se.regions.bed.gz.csi              # Index for regions.bed.gz
+│   ├── se.result.bed                      # Merged anomalous regions (BED)
+│   └── se.window_stats.tsv                # Window-level statistics
 ├── sas_pipeline_summary.txt         # Overall QV assessment and statistics
 ├── pipeline_config.json             # Configuration backup
 └── sas_pipeline.log                 # Detailed execution log
 ```
-
-
-## Configuration Options
-
-### Basic Parameters
-
-- `--threads`: Number of processing threads (default: 8)
-- `--skip-filter`: Skip BAM filtering if files are pre-filtered
-- `--no-be-analysis`: Skip BE (base-level errors) analysis
-- `--no-se-analysis`: Skip SE (structural errors) analysis
-
-### BE Analysis Parameters
-
-- `--be-window-size`: Window size for BE analysis (default: 50bp)
-- `--be-support-threshold`: Support threshold percentage (default: 10%)
-- `--be-local-threshold`: Local depth threshold for special regions (default: 10%)
-
-### SE Analysis Parameters
-
-- `--se-window-size`: Window size for SE analysis (default: 2000bp)
-- `--se-min-indel-length`: Minimum INDEL length for detection (default: 50bp)
-- `--se-depth-range`: Acceptable depth range as percentage of mean (default: 20-200%)
-- `--se-event-threshold`: Event support threshold for structural detection (default: 25%)
-- `--se-terminal-region`: Distance from chromosome ends for special handling (default: 10kb)
-
-### Special Region Handling
-
-- `--telomere-region`: Distance from chromosome ends (default: 10kb)
-- `--gc-threshold`: High GC content threshold (default: 90%)
-- `--repeat-gc-threshold`: GC threshold for repeat regions (default: 60%)
-- `--repeat-composition-threshold`: GA/CT composition threshold (default: 90%)
-
-
----
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
