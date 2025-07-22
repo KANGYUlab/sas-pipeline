@@ -58,17 +58,12 @@ import pysam
 # ===== SPANNING READS ANALYSIS FUNCTIONS =====
 
 def call_spanning_analysis(bam_file_path, fai_file, output_prefix, spanning_window_size=30000, spanning_step_size=2000, threads=multiprocessing.cpu_count()):
-    """Call spanning.py script to perform spanning reads analysis"""
-    
-    # Build spanning.py script path
-    script_dir = Path(__file__).parent.parent / "scripts"  
+    """Call spanning.py script to perform spanning reads analysis (outputs only merged+terminal-corrected bed)"""
+    script_dir = Path(__file__).parent.parent / "scripts"
     spanning_script = script_dir / "spanning.py"
-    
     if not spanning_script.exists():
         print(f"Error: spanning.py script not found at {spanning_script}", file=sys.stderr)
-        return []
-    
-    # Build command
+        return
     cmd = [
         "python3",
         str(spanning_script),
@@ -77,63 +72,46 @@ def call_spanning_analysis(bam_file_path, fai_file, output_prefix, spanning_wind
         "--window-size", str(spanning_window_size),
         "--step-size", str(spanning_step_size),
         "--output", output_prefix,
-        "--processes", str(threads),
-        "--merge",
-        "--bed"
+        "--processes", str(threads)
     ]
-    
     try:
         print(f"Running spanning reads analysis...", file=sys.stderr)
         print(f"Command: {' '.join(cmd)}", file=sys.stderr)
-        
-        # Run spanning analysis script
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        
-        # Print script's stderr output (contains progress information)
         if result.stderr:
             print(result.stderr, file=sys.stderr)
-        
-        # Read non-spanning regions results
-        non_spanning_bed = f"{output_prefix}.non_spanning.bed"
-        non_spanning_regions = []
-        
-        if os.path.exists(non_spanning_bed):
-            with open(non_spanning_bed, 'r') as f:
-                for line in f:
-                    if line.startswith('#') or line.startswith('chromosome'):
-                        continue  # Skip comments and headers
-                    fields = line.strip().split('\t')
-                    if len(fields) >= 3:
-                        chrom, start, end = fields[0], int(fields[1]), int(fields[2])
-                        non_spanning_regions.append((chrom, start, end))
-            
-            print(f"Loaded {len(non_spanning_regions)} non-spanning regions from {non_spanning_bed}", file=sys.stderr)
-        
-        return non_spanning_regions
-        
     except subprocess.CalledProcessError as e:
         print(f"Error running spanning analysis: {e}", file=sys.stderr)
         if e.stderr:
             print(f"Error output: {e.stderr}", file=sys.stderr)
-        return []
     except Exception as e:
         print(f"Unexpected error in spanning analysis: {e}", file=sys.stderr)
-        return []
 
-def assign_spanning_to_windows(merged_spanning_regions, window_size=2000):
-    """Assign merged spanning regions to 2k windows"""
-    spanning_windows = set()
-    
-    for chrom, start, end in merged_spanning_regions:
-        # Calculate all 2k windows covered by this region
-        start_window = (start // window_size) * window_size
-        end_window = ((end - 1) // window_size) * window_size
-        
-        # Add all covered windows
-        for window_start in range(start_window, end_window + window_size, window_size):
-            spanning_windows.add((chrom, window_start))
-    
-    return spanning_windows
+
+def assign_merged_regions_to_2k_windows(merged_regions, window_size=2000):
+    """Given merged+terminal-corrected regions (0-based), divide them into 2kb windows (chrom, start)."""
+    windows = set()
+    for chrom, region_start, region_end in merged_regions:
+        start = (region_start // window_size) * window_size
+        while start < region_end:
+            end = min(start + window_size, region_end)
+            if end > start:
+                windows.add((chrom, start))  # 0-based start
+            start += window_size
+    return windows
+
+def load_merged_non_spanning_regions_from_bed(bed_file):
+    """Load merged+terminal-corrected non-spanning regions from BED file (chrom, start, end, 0-based)."""
+    regions = []
+    with open(bed_file, 'r') as f:
+        for line in f:
+            if line.startswith('#') or line.strip() == '':
+                continue
+            fields = line.strip().split('\t')
+            if len(fields) >= 3:
+                chrom, start, end = fields[0], int(fields[1]), int(fields[2])
+                regions.append((chrom, start, end))
+    return regions
 
 # ===== ORIGINAL SE ANALYSIS CLASSES AND FUNCTIONS =====
 
@@ -539,102 +517,55 @@ def identify_anomalous_regions(
     Identify anomalous regions based on the integrated criteria including spanning reads.
     """
     anomalous_regions = []
-    
-    # First, calculate depth statistics
     all_depths = [depth for depth in depth_data.values() if depth > 0]
     if not all_depths:
         print("Warning: No depth data found")
         return anomalous_regions
-    
     mean_depth = np.mean(all_depths)
-    
-    # Updated thresholds: < 20% or > 200% of mean depth
     depth_lower_bound = mean_depth * 0.20
     depth_upper_bound = mean_depth * 2.0
-    
-    print(f"Depth statistics:")
-    print(f"  Mean depth: {mean_depth:.4f}")
-    print(f"  Lower bound (20% of mean): {depth_lower_bound:.4f}")
-    print(f"  Upper bound (200% of mean): {depth_upper_bound:.4f}")
-    
-    # Process each window
     for (chrom, window_start), counts in windows.items():
         chrom_length = chrom_lengths.get(chrom, 0)
-        window_end = min(window_start + window_size, chrom_length)  # Use actual chromosome length for terminal windows
-        
-        # Get depth for this window
+        window_end = min(window_start + window_size, chrom_length)
         local_depth = depth_data.get((chrom, window_start), 0.0)
-        
-        # Check if this is a terminal region (first or last 10kb)
-        # Use window_start to ensure strict 10kb boundary
-        is_terminal = (window_start < terminal_region_size) or \
-                     (window_start >= chrom_length - terminal_region_size)
-        
-        anomaly_reasons = []
-        anomaly_tags = []  # Store anomaly type tags
-        
-        # Check anomalies based on region type
+        is_terminal = (window_start < terminal_region_size) or (window_start >= chrom_length - terminal_region_size)
+        anomaly_tags = []
+        # Check non-spanning first
+        has_spanning = counts.get('HasSpanningReads', True)
+        if not has_spanning:
+            anomaly_tags.append("non_spanning")
+        # Other anomaly logic (clip, indel, depth) as before
         if not is_terminal:
-            # NON-TERMINAL REGIONS: Check depth, INDEL/clip and spanning anomalies
-            
-            # 1. Check depth anomalies
             if local_depth > 0:
                 if local_depth < depth_lower_bound:
-                    anomaly_reasons.append(f"Low depth ({local_depth:.2f} < {depth_lower_bound:.2f})")
                     anomaly_tags.append("low_depth")
                 elif local_depth > depth_upper_bound:
-                    anomaly_reasons.append(f"High depth ({local_depth:.2f} > {depth_upper_bound:.2f})")
                     anomaly_tags.append("high_depth")
-            
-            # 2. Check INDEL and clip anomalies
             total_reads = counts['TotalReads']
-            
-            # Check clips
             clip_count = counts['ClipCount']
             if total_reads > 0 and (clip_count / total_reads) > 0.5:
-                anomaly_reasons.append(f"High clip ratio ({clip_count}/{total_reads} = {clip_count/total_reads:.3f})")
                 anomaly_tags.append("clip")
-            
-            # Check insertions (use reads with insertions, not insertion count)
             insertion_reads = counts['ReadsWithInsertion']
             if total_reads > 0 and (insertion_reads / total_reads) > 0.5:
-                anomaly_reasons.append(f"High insertion reads ratio ({insertion_reads}/{total_reads} = {insertion_reads/total_reads:.3f})")
                 anomaly_tags.append("indel")
-            
-            # Check deletions (use reads with deletions, not deletion count)
             deletion_reads = counts['ReadsWithDeletion']
             if total_reads > 0 and (deletion_reads / total_reads) > 0.5:
-                anomaly_reasons.append(f"High deletion reads ratio ({deletion_reads}/{total_reads} = {deletion_reads/total_reads:.3f})")
                 anomaly_tags.append("indel")
-            
-            # 3. Check spanning reads
-            has_spanning = counts.get('HasSpanningReads', True)
-            if not has_spanning:
-                anomaly_reasons.append("No spanning reads")
-                anomaly_tags.append("non_spanning")
-        
         else:
-            # TERMINAL REGIONS (first/last 10kb): Only check reads without INDEL/clip, NO depth anomaly detection
             reads_without_indel_clip = counts['ReadsWithoutINDELorClip']
             total_reads = counts['TotalReads']
-            
-            # Anomaly: reads_without_indel_clip < 1 OR ratio <= 10%
             if total_reads > 0:
                 ratio = reads_without_indel_clip / total_reads
                 if reads_without_indel_clip < 1 or ratio <= 0.1:
-                    anomaly_reasons.append(f"Terminal region anomaly: reads without INDEL/clip ({reads_without_indel_clip}/{total_reads} = {ratio:.3f}) is too low")
-                    # For terminal regions, classify based on INDEL or clip status
                     if counts['Insertion'] > 0 or counts['Deletion'] > 0:
                         anomaly_tags.append("indel")
                     else:
                         anomaly_tags.append("clip")
-        
-        # If any anomalies were found, add this region
-        if anomaly_reasons:
-            error_type = classify_error_type('; '.join(anomaly_reasons))
+        # If any anomaly, output this window
+        if anomaly_tags:
             anomalous_regions.append({
                 'chromosome': chrom,
-                'start': window_start + 1,  # Convert to 1-based
+                'start': window_start + 1,
                 'end': window_end,
                 'is_terminal': is_terminal,
                 'depth': local_depth,
@@ -644,11 +575,8 @@ def identify_anomalous_regions(
                 'reads_without_indel_clip': counts['ReadsWithoutINDELorClip'],
                 'total_reads': counts['TotalReads'],
                 'has_spanning_reads': counts.get('HasSpanningReads', True),
-                'anomaly_reasons': '; '.join(anomaly_reasons),
-                'anomaly_tags': ','.join(anomaly_tags),  # New tags field
-                'error_type': error_type
+                'anomaly_tags': ','.join(anomaly_tags)
             })
-    
     return anomalous_regions
 
 
@@ -703,7 +631,6 @@ def save_results(
         f.write("Chromosome\tStart\tEnd\tDepth\tClipCount\tInsertion\tDeletion\t"
                 "ReadsWithInsertion\tReadsWithDeletion\tReadsWithClip\t"
                 "TotalReads\tReadsWithoutINDELorClip\tHasSpanningReads\n")
-        
         for (chrom, window_start), counts in sorted(windows.items()):
             chrom_length = chrom_lengths.get(chrom, window_start + window_size)
             window_end = min(window_start + window_size, chrom_length)
@@ -716,25 +643,35 @@ def save_results(
             has_spanning = counts.get('HasSpanningReads', True)
             f.write(f"{chrom}\t{window_start + 1}\t{window_end}\t{depth:.4f}\t"
                    f"{counts['ClipCount']}\t{counts['Insertion']}\t{counts['Deletion']}\t"
-                   f"{counts['ReadsWithInsertion']}\t{counts['ReadsWithDeletion']}\t"
-                   f"{counts['ReadsWithClip']}\t{counts['TotalReads']}\t"
+                   f"{counts['ReadsWithInsertion']}\t{counts['ReadsWithDeletion']}\t{counts['ReadsWithClip']}\t{counts['TotalReads']}\t"
                    f"{reads_without_indel_clip}\t{has_spanning}\n")
     print(f"Window statistics saved to: {stats_file}")
-    
-    # Save anomalous regions (no ErrorType column)
+
+    # Save anomalous regions (no AnomalyReasons column)
     anomalies_file = f"{output_prefix}.anomalous_regions.tsv"
     with open(anomalies_file, 'w') as f:
         f.write("Chromosome\tStart\tEnd\tIsTerminal\tDepth\tClipCount\t"
                 "InsertionCount\tDeletionCount\tReadsWithoutINDELClip\t"
-                "TotalReads\tHasSpanningReads\tAnomalyTags\tAnomalyReasons\n")
+                "TotalReads\tHasSpanningReads\tAnomalyTags\n")
         for region in anomalous_regions:
             f.write(f"{region['chromosome']}\t{region['start']}\t{region['end']}\t"
                    f"{region['is_terminal']}\t{region['depth']:.4f}\t"
                    f"{region['clip_count']}\t{region['insertion_count']}\t"
                    f"{region['deletion_count']}\t{region['reads_without_indel_clip']}\t"
                    f"{region['total_reads']}\t{region['has_spanning_reads']}\t"
-                   f"{region['anomaly_tags']}\t{region['anomaly_reasons']}\n")
+                   f"{region['anomaly_tags']}\n")
     print(f"Anomalous regions saved to: {anomalies_file}")
+
+    # Generate anomalous regions BED file (chr, start-1, end)
+    anomalies_bed_file = f"{output_prefix}.anomalous_regions.bed"
+    with open(anomalies_file, 'r') as fin, open(anomalies_bed_file, 'w') as fout:
+        next(fin)  # skip header
+        for line in fin:
+            fields = line.strip().split('\t')
+            if len(fields) >= 3:
+                start = max(0, int(fields[1]) - 1)
+                fout.write(f"{fields[0]}\t{start}\t{fields[2]}\n")
+    print(f"Anomalous regions BED saved to: {anomalies_bed_file}")
 
 # se.result.bed: anomalous_regions.tsv前三列，start-1，merge
 
@@ -902,7 +839,6 @@ Examples:
         print("\n" + "="*50)
         print("STEP 5: Analyzing spanning reads")
         print("="*50)
-        
         # Generate FAI file if it doesn't exist
         fai_file = args.reference_fa + '.fai'
         if not os.path.exists(fai_file):
@@ -912,25 +848,21 @@ Examples:
             except subprocess.CalledProcessError as e:
                 print(f"Error generating fai file: {e}", file=sys.stderr)
                 sys.exit(1)
-        
-        # Call the spanning analysis script
-        no_spanning_regions = call_spanning_analysis(
-            args.bam_file,
-            fai_file,
-            str(full_output_prefix),
-            args.spanning_window_size,
-            args.spanning_step_size,
-            args.threads
-        )
-        print(f"Loaded {len(no_spanning_regions)} non-spanning regions from script output")
-        
-                 # Note: spanning.py script has already handled terminal regions and merge
-         # So we can directly use the returned regions here
-        
-        # Assign merged spanning regions to 2k windows  
-        non_spanning_windows = assign_spanning_to_windows(no_spanning_regions, args.window_size)
-        print(f"Assigned {len(non_spanning_windows)} non-spanning windows")
-        
+        # Use the merged+terminal-corrected bed for 2kb window assignment
+        merged_bed = f"{full_output_prefix}.non_spanning_regions.merged.bed"
+        if not os.path.exists(merged_bed):
+            call_spanning_analysis(
+                args.bam_file,
+                fai_file,
+                str(full_output_prefix),
+                args.spanning_window_size,
+                args.spanning_step_size,
+                args.threads
+            )
+        merged_regions = load_merged_non_spanning_regions_from_bed(merged_bed)
+        print(f"Loaded {len(merged_regions)} merged non-spanning regions from {merged_bed}")
+        non_spanning_windows = assign_merged_regions_to_2k_windows(merged_regions, args.window_size)
+        print(f"Assigned {len(non_spanning_windows)} 2kb non-spanning windows from merged regions (0-based)")
         # Mark non-spanning windows in global counters
         global_counters.mark_non_spanning_windows(non_spanning_windows)
         
