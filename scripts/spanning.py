@@ -176,26 +176,18 @@ def process_terminal_regions(spanning_regions, chromosomes):
 
 
 def merge_regions_with_bedtools(regions, output_prefix):
-    """Merge regions using bedtools merge"""
+    """Merge regions using bedtools merge and return merged regions as a list of tuples."""
     if not regions:
         return []
-        
-    # Create temporary BED file
     temp_bed = f"{output_prefix}.temp_spanning.bed"
     merged_bed = f"{output_prefix}.spanning_regions.merged.bed"
-    
-    # Write BED format
     with open(temp_bed, 'w') as f:
         for chrom, start, end in regions:
             f.write(f"{chrom}\t{start}\t{end}\n")
-    
-    # Use bedtools merge to merge regions
     try:
         cmd = ["bedtools", "merge", "-i", temp_bed]
         with open(merged_bed, 'w') as f:
             subprocess.run(cmd, stdout=f, check=True)
-        
-        # Read merged results
         merged_regions = []
         with open(merged_bed, 'r') as f:
             for line in f:
@@ -203,27 +195,55 @@ def merge_regions_with_bedtools(regions, output_prefix):
                 if len(fields) >= 3:
                     chrom, start, end = fields[0], int(fields[1]), int(fields[2])
                     merged_regions.append((chrom, start, end))
-        
-        # Clean up temporary file
         os.remove(temp_bed)
-        
         print(f"Merged {len(regions)} regions into {len(merged_regions)} regions", file=sys.stderr)
-        print(f"Merged spanning regions saved to: {merged_bed}", file=sys.stderr)
-        
+        print(f"Final merged and terminal-corrected regions saved to: {merged_bed}", file=sys.stderr)
         return merged_regions
-        
     except subprocess.CalledProcessError as e:
         print(f"Error running bedtools merge: {e}", file=sys.stderr)
-        # Clean up temporary file
         if os.path.exists(temp_bed):
             os.remove(temp_bed)
         return regions
     except Exception as e:
         print(f"Error merging spanning regions: {e}", file=sys.stderr)
-        # Clean up temporary file
         if os.path.exists(temp_bed):
             os.remove(temp_bed)
         return regions
+
+
+def correct_terminal_regions(regions, chromosomes):
+    """Correct regions at chromosome start/end by cutting 28k from the end or start as needed."""
+    corrected = []
+    for chrom, start, end in regions:
+        chrom_length = chromosomes.get(chrom, 0)
+        if chrom_length == 0:
+            continue
+        # If at chromosome start
+        if start == 0:
+            new_end = end - 28000
+            if new_end > start:
+                corrected.append((chrom, start, new_end))
+        # If at chromosome end
+        elif end == chrom_length:
+            new_start = start + 28000
+            if new_start < end:
+                corrected.append((chrom, new_start, end))
+        else:
+            corrected.append((chrom, start, end))
+    return corrected
+
+
+def assign_corrected_regions_to_2k_windows(corrected_regions, window_size=2000):
+    """Given corrected merged regions, divide them into 2kb windows (chrom, start, end)."""
+    windows = []
+    for chrom, region_start, region_end in corrected_regions:
+        start = (region_start // window_size) * window_size
+        while start < region_end:
+            end = min(start + window_size, region_end)
+            if end > start:
+                windows.append((chrom, start, end))
+            start += window_size
+    return windows
 
 
 def main():
@@ -235,26 +255,15 @@ def main():
     parser.add_argument('-s', '--step-size', type=int, default=2000, 
                        help='Step size (default: 2000)')
     parser.add_argument('-o', '--output', required=True, help='Output prefix')
-    parser.add_argument('--bed', action='store_true', 
-                       help='Output BED format (default: table format with header)')
     parser.add_argument('-p', '--processes', type=int, default=multiprocessing.cpu_count(),
                        help=f'Number of parallel processes (default: {multiprocessing.cpu_count()})')
-    parser.add_argument('--merge', action='store_true',
-                       help='Merge overlapping regions and process chromosome terminals')
-    
     args = parser.parse_args()
-    
-    # Read fasta index file
     print(f"Reading fasta index from {args.fai_file}...", file=sys.stderr)
     chromosomes = read_fasta_index(args.fai_file)
     print(f"Found {len(chromosomes)} chromosomes", file=sys.stderr)
-    
-    # Generate sliding windows
     print(f"Generating sliding windows (window={args.window_size}, step={args.step_size})...", file=sys.stderr)
     windows = generate_sliding_windows(chromosomes, args.window_size, args.step_size)
     print(f"Generated {len(windows)} windows", file=sys.stderr)
-    
-    # Verify BAM file
     print(f"Verifying BAM file {args.bam_file}...", file=sys.stderr)
     try:
         test_bam = pysam.AlignmentFile(args.bam_file, "rb")
@@ -262,33 +271,20 @@ def main():
     except Exception as e:
         print(f"Error accessing BAM file {args.bam_file}: {e}", file=sys.stderr)
         sys.exit(1)
-    
-    # Split windows into batches for multiprocessing
     print(f"Splitting windows into batches for {args.processes} processes...", file=sys.stderr)
     window_batches = split_windows_into_batches(windows, args.processes)
     actual_processes = len(window_batches)
     print(f"Created {actual_processes} batches (optimized from {args.processes} processes)", file=sys.stderr)
-    
     if actual_processes < args.processes:
         avg_windows_per_batch = len(windows) // actual_processes if actual_processes > 0 else 0
         print(f"Optimized: Using {actual_processes} processes with ~{avg_windows_per_batch} windows per batch", file=sys.stderr)
-    
-    # Multiprocess analysis of windows
     total_windows = len(windows)
     no_spanning_windows = []
-    
     print(f"Analyzing {total_windows} windows with {actual_processes} processes...", file=sys.stderr)
-    
-    # Prepare arguments
     batch_args = [(args.bam_file, batch, i) for i, batch in enumerate(window_batches)]
-    
-    # Use multiprocessing
     with ProcessPoolExecutor(max_workers=actual_processes) as executor:
-        # Submit all tasks
         future_to_batch = {executor.submit(process_window_batch, batch_arg): i 
                           for i, batch_arg in enumerate(batch_args)}
-        
-        # Collect results
         completed_batches = 0
         for future in as_completed(future_to_batch):
             batch_id = future_to_batch[future]
@@ -299,40 +295,85 @@ def main():
                 print(f"Completed batch {completed_batches}/{len(window_batches)}", file=sys.stderr)
             except Exception as e:
                 print(f"Batch {batch_id} generated an exception: {e}", file=sys.stderr)
-    
-    # Sort output by chromosome and position
     no_spanning_windows.sort(key=lambda x: (x[0], x[1]))
-    
-    # Process terminal regions and merge (if requested)
-    if args.merge:
-        print("Processing terminal regions...", file=sys.stderr)
-        processed_regions = process_terminal_regions(no_spanning_windows, chromosomes)
-        print(f"Processed {len(processed_regions)} regions after terminal filtering", file=sys.stderr)
-        
-        print("Merging overlapping regions...", file=sys.stderr)
-        final_regions = merge_regions_with_bedtools(processed_regions, args.output)
-        no_spanning_windows = final_regions
-    
-    # Output results
-    output_file = f"{args.output}.non_spanning.bed"
-    with open(output_file, 'w') as outfile:
-        if not args.bed:
-            outfile.write("chromosome\tstart\tend\twindow_size\n")
-        
+    print("Merging non-spanning windows...", file=sys.stderr)
+    # After collecting all no_spanning_windows, write them to a temp BED file
+    temp_bed_file = f"{args.output}.non_spanning_windows.temp.bed"
+    with open(temp_bed_file, 'w') as f:
         for chrom, start, end in no_spanning_windows:
-            if args.bed:
-                outfile.write(f"{chrom}\t{start}\t{end}\n")
-            else:
-                outfile.write(f"{chrom}\t{start}\t{end}\t{end - start}\n")
-    
-    print(f"Results saved to: {output_file}", file=sys.stderr)
-    
-    # Output statistics
-    no_spanning_count = len(no_spanning_windows)
+            if start < 0:
+                print(f"Warning: Adjusting negative start to 0: {chrom}\t{start}\t{end}", file=sys.stderr)
+                start = 0
+            f.write(f"{chrom}\t{start}\t{end}\n")
+    print(f"Current working directory: {os.getcwd()}", file=sys.stderr)
+    print(f"Temp BED file: {os.path.abspath(temp_bed_file)}", file=sys.stderr)
+    # Check if temp BED file exists and is non-empty
+    if not os.path.exists(temp_bed_file) or os.path.getsize(temp_bed_file) == 0:
+        print(f"Error: {temp_bed_file} does not exist or is empty! No non-spanning windows found.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Temp BED file exists and is non-empty.", file=sys.stderr)
+    # Sort the temp BED file before merging
+    sorted_bed_file = temp_bed_file + ".sorted"
+    print(f"About to sort: {os.path.abspath(temp_bed_file)} -> {os.path.abspath(sorted_bed_file)}", file=sys.stderr)
+    try:
+        subprocess.run(f"sort -k1,1 -k2,2n {temp_bed_file} > {sorted_bed_file}", shell=True, check=True)
+        print(f"Sorted BED file created: {sorted_bed_file}", file=sys.stderr)
+        print(f"Sorted BED file absolute path: {os.path.abspath(sorted_bed_file)}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error sorting BED file: {e}", file=sys.stderr)
+        os.remove(temp_bed_file)
+        sys.exit(1)
+    # Use bedtools merge to merge all non-spanning windows
+    merged_bed_file = f"{args.output}.non_spanning_regions.merged.bed"
+    print(f"About to merge: {os.path.abspath(sorted_bed_file)} -> {os.path.abspath(merged_bed_file)}", file=sys.stderr)
+    cmd = ["bedtools", "merge", "-i", sorted_bed_file]
+    try:
+        with open(merged_bed_file, 'w') as outbed:
+            subprocess.run(cmd, stdout=outbed, check=True)
+        print(f"bedtools merge completed: {merged_bed_file}", file=sys.stderr)
+        print(f"Merged BED file absolute path: {os.path.abspath(merged_bed_file)}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error running bedtools merge: {e}", file=sys.stderr)
+        os.remove(temp_bed_file)
+        os.remove(sorted_bed_file)
+        sys.exit(1)
+    # Read merged regions for terminal correction
+    merged_regions = []
+    with open(merged_bed_file, 'r') as f:
+        for line in f:
+            fields = line.strip().split('\t')
+            if len(fields) >= 3:
+                chrom, start, end = fields[0], int(fields[1]), int(fields[2])
+                merged_regions.append((chrom, start, end))
+    os.remove(temp_bed_file)
+    os.remove(sorted_bed_file)
+    if not merged_regions:
+        print(f"Warning: No merged non-spanning regions found!", file=sys.stderr)
+    # Apply terminal correction
+    print("Applying terminal region correction...", file=sys.stderr)
+    final_regions = correct_terminal_regions(merged_regions, chromosomes)
+    print(f"{len(final_regions)} regions remain after terminal correction", file=sys.stderr)
+    # Overwrite merged_bed_file with terminal-corrected regions
+    with open(merged_bed_file, 'w') as outfile:
+        for chrom, start, end in final_regions:
+            if start >= end:
+                continue
+            outfile.write(f"{chrom}\t{start}\t{end}\n")
+    print(f"Results saved to: {merged_bed_file}", file=sys.stderr)
     print(f"Analysis complete!", file=sys.stderr)
     print(f"Total windows analyzed: {total_windows}", file=sys.stderr)
-    print(f"Windows without spanning reads: {no_spanning_count}", file=sys.stderr)
-    print(f"Percentage without spanning reads: {no_spanning_count/total_windows*100:.2f}%", file=sys.stderr)
+    print(f"Final non-spanning merged regions: {len(final_regions)}", file=sys.stderr)
+    # Assign corrected regions to 2kb windows and output
+    print("Assigning corrected regions to 2kb windows...", file=sys.stderr)
+    windows_2k = assign_corrected_regions_to_2k_windows(final_regions, window_size=2000)
+    print(f"{len(windows_2k)} 2kb non-spanning windows generated", file=sys.stderr)
+    nonspanning_bed_file = f"{args.output}.non_spanning.bed"
+    with open(nonspanning_bed_file, 'w') as outfile:
+        for chrom, start, end in windows_2k:
+            if start >= end:
+                continue
+            outfile.write(f"{chrom}\t{start}\t{end}\n")
+    print(f"Results saved to: {nonspanning_bed_file}", file=sys.stderr)
 
 
 if __name__ == "__main__":
