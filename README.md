@@ -63,7 +63,7 @@ The support threshold is relaxed to >10% of local depth in challenging regions w
 
 - **BED file:** All merged and terminal-corrected non-spanning regions are output as `se.non_spanning_regions.merged.bed` (0-based, BED format).
 
-- **Output:** Windows overlapping these merged regions are tagged as `non_spanning` in the anomaly files and summarized in the `non-spanning` column of `se.anomaly_summary.tsv`.
+
 ### Quality Value Calculation
 
 The final assembly quality is quantified using the Phred-scaled Quality Value:
@@ -242,20 +242,59 @@ python src/sas_pipeline.py \
   --se-min-indel-length 50
 ```
 
-## Input Requirements
+## Parameters Reference
 
-### Required Files
+### Required Parameters
 
-1. **Short-read BAM**: High-quality Illumina or similar short-read data
-2. **HiFi BAM**: PacBio HiFi long-read data
-3. **ONT BAM**: Oxford Nanopore long-read data
-4. **Reference FASTA**: Reference genome sequence
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `--short-read-bam` | string | **Required.** Path to short-read BAM file (Illumina, Element, etc.). |
+| `--hifi-bam` | string | **Required.** Path to HiFi BAM file (PacBio HiFi).  |
+| `--ont-bam` | string | **Required.** Path to ONT BAM file (Oxford Nanopore).  |
+| `--reference-fa` | string | **Required.** Path to reference genome FASTA file. Will be indexed automatically if `.fai` not provided. |
+| `--output-dir` | string | **Required.** Output directory for all results. Will be created if it doesn't exist. |
 
-### File Format Requirements
+### Optional Parameters
 
-- All BAM files must be sorted and indexed
-- Reference FASTA should be indexed (`.fai` file will be generated automatically if not provided)
-- Chromosome names must be consistent across all files
+#### Basic Configuration
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--reference-fai` | string | auto-generated | Path to reference genome FASTA index file (.fai). If not provided, will be generated automatically from `--reference-fa`. |
+| `--threads` | integer | 8 | Number of threads to use for parallel processing. Recommended: 32-128. |
+| `--scripts-dir` | string | `{pipeline_base}/scripts` | Path to scripts directory containing analysis tools. |
+| `--src-dir` | string | `{pipeline_base}/src` | Path to source directory containing pipeline modules. |
+
+#### Pipeline Control
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--skip-filter` | flag | False | Skip BAM filtering step if input BAM files are already filtered. Use when BAMs are pre-processed. |
+| `--no-be-analysis` | flag | False | Skip base error (BE) analysis completely. Only runs SE analysis. |
+| `--no-se-analysis` | flag | False | Skip structural error (SE) analysis completely. Only runs BE analysis. |
+
+#### SE Analysis Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--se-window-size` | integer | 2000 | Window size for SE analysis in base pairs. Standard is 2kb windows. |
+| `--se-min-indel-length` | integer | 50 | Minimum INDEL length for SE analysis in base pairs. Events smaller than this are ignored. |
+
+#### Bed Masking Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--bed-files` | string(s) | None | Paths to bed files for masking (e.g., `chr1.bed chr2.bed`). Multiple files are allowed. Regions in these files will be excluded from analysis. |
+
+#### Information
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `--version` | flag | Display version information and exit. |
+| `--help` | flag | Display help information and exit. |
+
+
+
 
 ## Output Structure
 
