@@ -323,3 +323,12 @@ results/
 ├── pipeline_config.json             # Configuration backup
 └── sas_pipeline.log                 # Detailed execution log
 ```
+
+## Citation
+
+If you use the SAS method in your research, please cite:
+
+```
+Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang, Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao, Yu Kang. Approaching an Error-Free Diploid Human Genome. bioRxiv. doi: https://doi.org/10.1101/2025.08.01.667781
+```
+
