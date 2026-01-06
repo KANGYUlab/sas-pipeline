@@ -315,29 +315,29 @@ def process_region(args):
 
 def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_batch_size=1000):
     """
-    使用两阶段合并策略：先合并成中间文件，再合并最终文件
-    使用多线程并行读取以提高速度
+    Uses a two-phase merge strategy: first merge into intermediate files, then merge to final file
+    Uses multi-threaded parallel reading to improve speed
     """
     if not file_list:
         return
     
     total_files = len(file_list)
-    print(f"  - 开始两阶段合并: {total_files} 个文件, 使用 {num_threads} 个线程...", file=sys.stderr)
+    print(f"  - Starting two-phase merge: {total_files} files, using {num_threads} threads...", file=sys.stderr)
     
-    # 第一阶段：将小文件合并成中间文件
+    # Phase 1: Merge small files into intermediate files
     intermediate_dir = os.path.join(os.path.dirname(output_file), "merge_intermediate")
     os.makedirs(intermediate_dir, exist_ok=True)
     
     intermediate_files = []
     intermediate_batch_num = 0
     
-    # 将文件列表分成批次
+    # Split file list into batches
     for i in range(0, total_files, intermediate_batch_size):
         batch_files = file_list[i:i+intermediate_batch_size]
         intermediate_file = os.path.join(intermediate_dir, f"intermediate_{intermediate_batch_num:06d}.txt")
         intermediate_files.append(intermediate_file)
         
-        # 使用多线程并行读取批次内的文件，但保持顺序
+        # Use multi-threading to read files in batch in parallel, but maintain order
         def read_file_content(file_path):
             try:
                 with open(file_path, 'r', buffering=1024*1024) as f:  # 1MB buffer
@@ -346,10 +346,10 @@ def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_bat
                 print(f"Warning: Could not read file {file_path}: {e}", file=sys.stderr)
                 return None
         
-        # 并行读取所有文件，但保持原始顺序
+        # Read all files in parallel, but maintain original order
         file_contents = [None] * len(batch_files)
         with ThreadPoolExecutor(max_workers=min(num_threads, len(batch_files))) as executor:
-            # 使用字典保存索引，确保按顺序写入
+            # Use dictionary to save indices, ensuring sequential writing
             future_to_index = {executor.submit(read_file_content, f): idx 
                               for idx, f in enumerate(batch_files)}
             for future in as_completed(future_to_index):
@@ -358,7 +358,7 @@ def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_bat
                 if content is not None:
                     file_contents[idx] = content
         
-        # 写入中间文件（按顺序）
+        # Write to intermediate file (in order)
         if any(file_contents):
             with open(intermediate_file, 'w', buffering=1024*1024) as f_out:
                 for content in file_contents:
@@ -367,28 +367,28 @@ def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_bat
         
         intermediate_batch_num += 1
         if intermediate_batch_num % 10 == 0:
-            print(f"    - 第一阶段: 已创建 {intermediate_batch_num} 个中间文件...", file=sys.stderr)
+            print(f"    - Phase 1: Created {intermediate_batch_num} intermediate files...", file=sys.stderr)
     
-    print(f"  - 第一阶段完成: 创建了 {len(intermediate_files)} 个中间文件", file=sys.stderr)
+    print(f"  - Phase 1 complete: Created {len(intermediate_files)} intermediate files", file=sys.stderr)
     
-    # 第二阶段：合并中间文件到最终输出
-    print(f"  - 第二阶段: 合并 {len(intermediate_files)} 个中间文件到最终输出...", file=sys.stderr)
+    # Phase 2: Merge intermediate files to final output
+    print(f"  - Phase 2: Merging {len(intermediate_files)} intermediate files to final output...", file=sys.stderr)
     
-    # 尝试使用系统 cat 命令（最快）
+    # Try using system cat command (fastest)
     try:
         with open(output_file, 'w', buffering=1024*1024) as final_out:
-            # 如果中间文件数量不多，可以直接用 cat
+            # If number of intermediate files is small, can directly use cat
             if len(intermediate_files) <= 1000:
                 cat_cmd = ['cat'] + intermediate_files
                 result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                       universal_newlines=True, bufsize=1024*1024)
                 if result.returncode == 0:
                     final_out.write(result.stdout)
-                    print(f"  - 第二阶段完成: 使用系统 cat 命令", file=sys.stderr)
+                    print(f"  - Phase 2 complete: Used system cat command", file=sys.stderr)
                 else:
                     raise subprocess.CalledProcessError(result.returncode, cat_cmd)
             else:
-                # 如果中间文件太多，分批使用 cat
+                # If too many intermediate files, use cat in batches
                 final_batch_size = 500
                 for i in range(0, len(intermediate_files), final_batch_size):
                     batch = intermediate_files[i:i+final_batch_size]
@@ -400,11 +400,11 @@ def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_bat
                     else:
                         raise subprocess.CalledProcessError(result.returncode, cat_cmd)
                     if (i // final_batch_size + 1) % 10 == 0:
-                        print(f"    - 已处理 {i + len(batch)}/{len(intermediate_files)} 个中间文件...", file=sys.stderr)
-                print(f"  - 第二阶段完成: 使用分批系统 cat", file=sys.stderr)
+                        print(f"    - Processed {i + len(batch)}/{len(intermediate_files)} intermediate files...", file=sys.stderr)
+                print(f"  - Phase 2 complete: Used batched system cat", file=sys.stderr)
     except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-        # 回退到 Python 多线程合并（保持顺序）
-        print(f"  - 系统 cat 失败 ({e}), 使用 Python 多线程合并（保持顺序）...", file=sys.stderr)
+        # Fallback to Python multi-threaded merge (maintaining order)
+        print(f"  - System cat failed ({e}), using Python multi-threaded merge (maintaining order)...", file=sys.stderr)
         
         def merge_intermediate_file(intermediate_file):
             try:
@@ -414,7 +414,7 @@ def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_bat
                 print(f"Warning: Could not read intermediate file {intermediate_file}: {e}", file=sys.stderr)
                 return None
         
-        # 并行读取但保持顺序
+        # Read in parallel but maintain order
         file_contents = [None] * len(intermediate_files)
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             future_to_index = {executor.submit(merge_intermediate_file, f): idx 
@@ -425,17 +425,17 @@ def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_bat
                 if content is not None:
                     file_contents[idx] = content
         
-        # 按顺序写入最终文件
+        # Write to final file in order
         with open(output_file, 'w', buffering=1024*1024) as final_out:
             for content in file_contents:
                 if content is not None:
                     final_out.write(content)
         
-        print(f"  - 第二阶段完成: 使用 Python 多线程合并", file=sys.stderr)
+        print(f"  - Phase 2 complete: Used Python multi-threaded merge", file=sys.stderr)
     
-    # 清理中间文件目录
+    # Clean up intermediate file directory
     shutil.rmtree(intermediate_dir)
-    print(f"  - 清理中间文件目录完成", file=sys.stderr)
+    print(f"  - Cleanup of intermediate file directory complete", file=sys.stderr)
 
 def process_bed_regions(bed_file, bam_file, ref_fasta, output_file, temp_dir_path=None, processes=64):
     """
@@ -493,12 +493,12 @@ def process_bed_regions(bed_file, bam_file, ref_fasta, output_file, temp_dir_pat
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
     
-    # 使用优化的两阶段合并策略
-    # 根据文件数量决定使用哪种策略
+    # Use optimized two-phase merge strategy
+    # Decide which strategy to use based on number of files
     num_files = len(all_successful_files)
     
     if num_files <= 1000:
-        # 文件数量较少，使用原来的单阶段合并（更快）
+        # Fewer files, use original single-phase merge (faster)
         try:
             with open(output_file, 'w', buffering=1024*1024) as final_out:
                 cat_cmd = ['cat'] + all_successful_files
@@ -506,27 +506,27 @@ def process_bed_regions(bed_file, bam_file, ref_fasta, output_file, temp_dir_pat
                                       universal_newlines=True, bufsize=1024*1024)
                 if result.returncode == 0:
                     final_out.write(result.stdout)
-                    print(f"  - 快速合并完成: 使用系统 cat 命令", file=sys.stderr)
+                    print(f"  - Fast merge complete: Used system cat command", file=sys.stderr)
                 else:
                     raise subprocess.CalledProcessError(result.returncode, cat_cmd)
         except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-            # 回退到 Python 合并
-            print(f"  - Cat 命令失败 ({e}), 使用 Python 合并...", file=sys.stderr)
+            # Fallback to Python merge
+            print(f"  - Cat command failed ({e}), using Python merge...", file=sys.stderr)
             with open(output_file, 'w', buffering=1024*1024) as final_out:
                 for i, temp_file in enumerate(all_successful_files):
                     if i % 1000 == 0 and i > 0:
-                        print(f"    - 已合并 {i}/{num_files} 个文件...", file=sys.stderr)
+                        print(f"    - Merged {i}/{num_files} files...", file=sys.stderr)
                     try:
                         with open(temp_file, 'r', buffering=512*1024) as temp_in:
                             shutil.copyfileobj(temp_in, final_out, 1024*1024)
                     except IOError as e:
                         print(f"Warning: Could not read temp file {temp_file}: {e}", file=sys.stderr)
     else:
-        # 文件数量较多，使用两阶段合并 + 多线程
-        # 计算合适的中间批次大小和线程数
-        # 中间批次大小：每个中间文件包含约 1000 个小文件
+        # More files, use two-phase merge + multi-threading
+        # Calculate appropriate intermediate batch size and thread count
+        # Intermediate batch size: each intermediate file contains approximately 1000 small files
         intermediate_batch_size = 1000
-        # 线程数：使用进程数的一半，但不超过 16
+        # Thread count: use half of process count, but no more than 16
         num_threads = min(max(processes // 2, 4), 16)
         
         merge_files_parallel(all_successful_files, output_file, 
