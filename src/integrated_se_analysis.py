@@ -673,7 +673,7 @@ def save_results(
                 fout.write(f"{fields[0]}\t{start}\t{fields[2]}\n")
     print(f"Anomalous regions BED saved to: {anomalies_bed_file}")
 
-# se.result.bed: anomalous_regions.tsv前三列，start-1，merge
+# se.result.bed: First three columns of anomalous_regions.tsv, start-1, then merge
 
 def generate_se_result_bed(anomalous_regions_file, output_bed):
     """Generate se.result.bed by merging se.anomalous_regions.tsv (chr, start-1, end) with bedtools merge."""
@@ -693,7 +693,7 @@ def generate_se_result_bed(anomalous_regions_file, output_bed):
     os.remove(bed_tmp)
     print(f"Merged SE result BED saved to: {output_bed}")
 
-# save_anomaly_summary: spanning列改为non-spanning
+# save_anomaly_summary: Change spanning column to non-spanning
 
 def save_anomaly_summary(anomalous_regions, chrom_lengths, output_prefix):
     from collections import defaultdict

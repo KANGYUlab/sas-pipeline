@@ -17,23 +17,43 @@ import signal
 import os
 import shutil
 from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 def process_pileup_from_file(raw_pileup_path, region_start, region_end):
     """
     Reads a raw pileup file from disk, calculates average depth, then processes it.
     This version implements the proper cross-row alignment logic with correct processing order.
     """
+    HIGH_DEPTH_THRESHOLD = 1000
+
     # Pass 1: Calculate average depth.
     total_depth = 0
     line_count = 0
+    first_parts = None
     with open(raw_pileup_path, 'r') as f:
         for line in f:
             parts = line.strip().split('\t')
+            if first_parts is None and parts:
+                first_parts = parts
             if len(parts) >= 4 and parts[3].isdigit():
                 total_depth += int(parts[3])
             line_count += 1
     
     average_depth = (total_depth / line_count) if line_count > 0 else 0.0
+
+    # If depth is too high, short‑circuit and mark region as unsupported for this platform.
+    if average_depth > HIGH_DEPTH_THRESHOLD:
+        print(f"Depth too high ({average_depth:.2f}) for region {region_start}-{region_end}; marking as unsupported.", file=sys.stderr)
+        if not first_parts:
+            first_parts = ["chrN", str(region_start), str(region_end), ".", "."]
+        # Ensure we have at least 5 columns to mimic original structure
+        while len(first_parts) < 5:
+            first_parts.append(".")
+        cleaned_pileup = "DEPTH_TOO_HIGH"
+        min_length = "0"
+        output_parts = first_parts[:5] + [cleaned_pileup, first_parts[0], str(region_start), str(region_end), min_length, f"{average_depth:.2f}"]
+        return ['\t'.join(output_parts)]
 
     # Pass 2: Load all lines and extract pileup strings for processing
     all_lines = []
@@ -293,6 +313,130 @@ def process_region(args):
     
     return None
 
+def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_batch_size=1000):
+    """
+    使用两阶段合并策略：先合并成中间文件，再合并最终文件
+    使用多线程并行读取以提高速度
+    """
+    if not file_list:
+        return
+    
+    total_files = len(file_list)
+    print(f"  - 开始两阶段合并: {total_files} 个文件, 使用 {num_threads} 个线程...", file=sys.stderr)
+    
+    # 第一阶段：将小文件合并成中间文件
+    intermediate_dir = os.path.join(os.path.dirname(output_file), "merge_intermediate")
+    os.makedirs(intermediate_dir, exist_ok=True)
+    
+    intermediate_files = []
+    intermediate_batch_num = 0
+    
+    # 将文件列表分成批次
+    for i in range(0, total_files, intermediate_batch_size):
+        batch_files = file_list[i:i+intermediate_batch_size]
+        intermediate_file = os.path.join(intermediate_dir, f"intermediate_{intermediate_batch_num:06d}.txt")
+        intermediate_files.append(intermediate_file)
+        
+        # 使用多线程并行读取批次内的文件，但保持顺序
+        def read_file_content(file_path):
+            try:
+                with open(file_path, 'r', buffering=1024*1024) as f:  # 1MB buffer
+                    return f.read()
+            except IOError as e:
+                print(f"Warning: Could not read file {file_path}: {e}", file=sys.stderr)
+                return None
+        
+        # 并行读取所有文件，但保持原始顺序
+        file_contents = [None] * len(batch_files)
+        with ThreadPoolExecutor(max_workers=min(num_threads, len(batch_files))) as executor:
+            # 使用字典保存索引，确保按顺序写入
+            future_to_index = {executor.submit(read_file_content, f): idx 
+                              for idx, f in enumerate(batch_files)}
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                content = future.result()
+                if content is not None:
+                    file_contents[idx] = content
+        
+        # 写入中间文件（按顺序）
+        if any(file_contents):
+            with open(intermediate_file, 'w', buffering=1024*1024) as f_out:
+                for content in file_contents:
+                    if content is not None:
+                        f_out.write(content)
+        
+        intermediate_batch_num += 1
+        if intermediate_batch_num % 10 == 0:
+            print(f"    - 第一阶段: 已创建 {intermediate_batch_num} 个中间文件...", file=sys.stderr)
+    
+    print(f"  - 第一阶段完成: 创建了 {len(intermediate_files)} 个中间文件", file=sys.stderr)
+    
+    # 第二阶段：合并中间文件到最终输出
+    print(f"  - 第二阶段: 合并 {len(intermediate_files)} 个中间文件到最终输出...", file=sys.stderr)
+    
+    # 尝试使用系统 cat 命令（最快）
+    try:
+        with open(output_file, 'w', buffering=1024*1024) as final_out:
+            # 如果中间文件数量不多，可以直接用 cat
+            if len(intermediate_files) <= 1000:
+                cat_cmd = ['cat'] + intermediate_files
+                result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                      universal_newlines=True, bufsize=1024*1024)
+                if result.returncode == 0:
+                    final_out.write(result.stdout)
+                    print(f"  - 第二阶段完成: 使用系统 cat 命令", file=sys.stderr)
+                else:
+                    raise subprocess.CalledProcessError(result.returncode, cat_cmd)
+            else:
+                # 如果中间文件太多，分批使用 cat
+                final_batch_size = 500
+                for i in range(0, len(intermediate_files), final_batch_size):
+                    batch = intermediate_files[i:i+final_batch_size]
+                    cat_cmd = ['cat'] + batch
+                    result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          universal_newlines=True, bufsize=1024*1024)
+                    if result.returncode == 0:
+                        final_out.write(result.stdout)
+                    else:
+                        raise subprocess.CalledProcessError(result.returncode, cat_cmd)
+                    if (i // final_batch_size + 1) % 10 == 0:
+                        print(f"    - 已处理 {i + len(batch)}/{len(intermediate_files)} 个中间文件...", file=sys.stderr)
+                print(f"  - 第二阶段完成: 使用分批系统 cat", file=sys.stderr)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+        # 回退到 Python 多线程合并（保持顺序）
+        print(f"  - 系统 cat 失败 ({e}), 使用 Python 多线程合并（保持顺序）...", file=sys.stderr)
+        
+        def merge_intermediate_file(intermediate_file):
+            try:
+                with open(intermediate_file, 'r', buffering=1024*1024) as f_in:
+                    return f_in.read()
+            except IOError as e:
+                print(f"Warning: Could not read intermediate file {intermediate_file}: {e}", file=sys.stderr)
+                return None
+        
+        # 并行读取但保持顺序
+        file_contents = [None] * len(intermediate_files)
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            future_to_index = {executor.submit(merge_intermediate_file, f): idx 
+                              for idx, f in enumerate(intermediate_files)}
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                content = future.result()
+                if content is not None:
+                    file_contents[idx] = content
+        
+        # 按顺序写入最终文件
+        with open(output_file, 'w', buffering=1024*1024) as final_out:
+            for content in file_contents:
+                if content is not None:
+                    final_out.write(content)
+        
+        print(f"  - 第二阶段完成: 使用 Python 多线程合并", file=sys.stderr)
+    
+    # 清理中间文件目录
+    shutil.rmtree(intermediate_dir)
+    print(f"  - 清理中间文件目录完成", file=sys.stderr)
+
 def process_bed_regions(bed_file, bam_file, ref_fasta, output_file, temp_dir_path=None, processes=64):
     """
     Reads a BED file in chunks and processes them in parallel.
@@ -349,42 +493,45 @@ def process_bed_regions(bed_file, bam_file, ref_fasta, output_file, temp_dir_pat
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
     
-    # Use batched system cat command for fastest merge, with fallback to Python
-    batch_size = 1000  # Process files in batches to avoid "Argument list too long" error
+    # 使用优化的两阶段合并策略
+    # 根据文件数量决定使用哪种策略
+    num_files = len(all_successful_files)
     
-    try:
-        # Try using batched system cat commands for fastest merge
-        with open(output_file, 'w') as final_out:
-            for i in range(0, len(all_successful_files), batch_size):
-                batch_files = all_successful_files[i:i+batch_size]
-                batch_num = i // batch_size + 1
-                total_batches = (len(all_successful_files) + batch_size - 1) // batch_size
-                
-                print(f"  - Processing batch {batch_num}/{total_batches} ({len(batch_files)} files)...", file=sys.stderr)
-                
-                cat_cmd = ['cat'] + batch_files
-                result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-                
-                if result.returncode != 0:
-                    raise subprocess.CalledProcessError(result.returncode, cat_cmd, result.stderr)
-                
-                final_out.write(result.stdout)
-                
-        print(f"  - Fast merge completed using batched system 'cat' commands.", file=sys.stderr)
+    if num_files <= 1000:
+        # 文件数量较少，使用原来的单阶段合并（更快）
+        try:
+            with open(output_file, 'w', buffering=1024*1024) as final_out:
+                cat_cmd = ['cat'] + all_successful_files
+                result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                      universal_newlines=True, bufsize=1024*1024)
+                if result.returncode == 0:
+                    final_out.write(result.stdout)
+                    print(f"  - 快速合并完成: 使用系统 cat 命令", file=sys.stderr)
+                else:
+                    raise subprocess.CalledProcessError(result.returncode, cat_cmd)
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+            # 回退到 Python 合并
+            print(f"  - Cat 命令失败 ({e}), 使用 Python 合并...", file=sys.stderr)
+            with open(output_file, 'w', buffering=1024*1024) as final_out:
+                for i, temp_file in enumerate(all_successful_files):
+                    if i % 1000 == 0 and i > 0:
+                        print(f"    - 已合并 {i}/{num_files} 个文件...", file=sys.stderr)
+                    try:
+                        with open(temp_file, 'r', buffering=512*1024) as temp_in:
+                            shutil.copyfileobj(temp_in, final_out, 1024*1024)
+                    except IOError as e:
+                        print(f"Warning: Could not read temp file {temp_file}: {e}", file=sys.stderr)
+    else:
+        # 文件数量较多，使用两阶段合并 + 多线程
+        # 计算合适的中间批次大小和线程数
+        # 中间批次大小：每个中间文件包含约 1000 个小文件
+        intermediate_batch_size = 1000
+        # 线程数：使用进程数的一半，但不超过 16
+        num_threads = min(max(processes // 2, 4), 16)
         
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-        # Fallback to Python-based merge with optimized buffering
-        print(f"  - Cat command failed ({e}), using Python-based merge with optimized buffering...", file=sys.stderr)
-        with open(output_file, 'w', buffering=1024*1024) as final_out:  # 1MB buffer
-            for i, temp_file in enumerate(all_successful_files):
-                if i % 1000 == 0:  # Progress indicator every 1000 files
-                    print(f"    - Merged {i}/{len(all_successful_files)} files...", file=sys.stderr)
-                try:
-                    with open(temp_file, 'r', buffering=512*1024) as temp_in:  # 512KB buffer
-                        # Use shutil.copyfileobj for efficient copying
-                        shutil.copyfileobj(temp_in, final_out, 1024*1024)  # 1MB chunks
-                except IOError as e:
-                    print(f"Warning: Could not read temp file {temp_file}: {e}", file=sys.stderr)
+        merge_files_parallel(all_successful_files, output_file, 
+                           num_threads=num_threads, 
+                           intermediate_batch_size=intermediate_batch_size)
 
     print(f"Cleaning up temporary directory: {temp_dir}", file=sys.stderr)
     shutil.rmtree(temp_dir)

@@ -55,6 +55,44 @@ class BedMask:
     def __init__(self, bed_files, output_dir):
         self.bed_files = bed_files
         self.output_dir = Path(output_dir)
+
+    def mask_bed_regions(self, input_file, output_file, description=""):
+        """
+        Prefer bedtools intersect -v to subtract user-provided mask beds from
+        the BE candidate BED produced by smallerror_short.
+        """
+        if not self.bed_files:
+            shutil.copy(input_file, output_file)
+            return
+        
+        input_file = Path(input_file)
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try fast path with bedtools; fallback to Python implementation on error
+        try:
+            cmd = [
+                "bedtools", "intersect", "-v",
+                "-a", str(input_file),
+                "-b", *[str(b) for b in self.bed_files]
+            ]
+            # Use temporary file to filter empty lines
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.bed') as tmp_out:
+                tmp_file = tmp_out.name
+                subprocess.run(cmd, check=True, stdout=tmp_out)
+            
+            # Filter empty lines from bedtools output
+            with open(tmp_file, 'r') as fin, open(output_file, 'w') as fout:
+                for line in fin:
+                    if line.strip():  # Only write non-empty lines
+                        fout.write(line)
+            
+            # Remove temporary file
+            os.unlink(tmp_file)
+        except Exception as e:
+            print(f"Warning: bedtools masking failed for {description}: {e}. Falling back to Python masking.")
+            self.apply_bedtools_intersect_v(input_file, output_file, description)
     
     def apply_bedtools_intersect_v(self, input_file, output_file, description=""):
         """Apply bed masking by directly checking overlap with mask regions"""
@@ -119,9 +157,14 @@ class BedMask:
             if is_tsv:
                 # Write header
                 header = fin.readline()
-                fout.write(header)
+                if header.strip():  # Only write non-empty header
+                    fout.write(header)
             
             for line in fin:
+                # Skip empty lines
+                if not line.strip():
+                    continue
+                
                 fields = line.strip().split('\t')
                 if len(fields) >= 3:
                     try:
@@ -138,31 +181,34 @@ class BedMask:
                                 break
                         
                         if not overlaps:
-                            fout.write(line + '\n')
+                            fout.write(line.rstrip() + '\n')  # Remove trailing whitespace
                             kept_lines += 1
                         else:
                             removed_lines += 1
                     except ValueError:
                         print(f"Warning: Invalid coordinates in line: {line.strip()}")
-                        # Keep lines with invalid coordinates
-                        fout.write(line + '\n')
-                        kept_lines += 1
+                        # Keep lines with invalid coordinates (but skip if empty)
+                        if line.strip():
+                            fout.write(line.rstrip() + '\n')
+                            kept_lines += 1
                 else:
-                    # Keep lines with insufficient fields
-                    fout.write(line + '\n')
-                    kept_lines += 1
+                    # Skip lines with insufficient fields (likely empty or malformed)
+                    # Only keep if it's a comment line
+                    if line.strip().startswith('#'):
+                        fout.write(line.rstrip() + '\n')
+                        kept_lines += 1
         
         print(f"Masking completed: kept {kept_lines} lines, removed {removed_lines} lines")
     
     def get_masked_length(self, chrom):
         """
-        计算指定染色体被masked的总长度
+        Calculate the total length of masked regions for a specified chromosome.
         
         Args:
-            chrom: 染色体名称
+            chrom: Chromosome name
             
         Returns:
-            int: 被masked的总长度
+            int: Total length of masked regions
         """
         total_masked_length = 0
         
@@ -182,7 +228,7 @@ class BedMask:
                                     start = int(parts[1])
                                     end = int(parts[2])
                                     
-                                    # 只计算指定染色体的masked长度
+                                    # Only calculate masked length for the specified chromosome
                                     if bed_chrom == chrom:
                                         masked_length = end - start
                                         total_masked_length += masked_length
@@ -235,6 +281,18 @@ class SASPipeline:
         self.bed_files = config.get('bed_files', [])
         self.bed_mask = BedMask(self.bed_files, self.output_dir) if self.bed_files else None
         
+        # Additional bed file for BE analysis (will be split into 50bp windows and merged with low-coverage regions)
+        self.additional_bed_file = config.get('additional_bed_file')
+        if self.additional_bed_file:
+            self.additional_bed_file = Path(self.additional_bed_file).resolve()
+            self.logger.info(f"Additional bed file for BE analysis: {self.additional_bed_file}")
+        
+        # IR (Identical Region) generation option
+        self.generate_ir = config.get('generate_ir', False)
+        if self.generate_ir:
+            self.logger.info("IR (Identical Region) generation enabled - this will be slow")
+            self.logger.info("IR regions will be generated using genmap on parental haplotypes")
+        
         # Log the resolved paths
         self.logger.info(f"Short-read BAM: {self.short_read_bam}")
         self.logger.info(f"HiFi BAM: {self.hifi_bam}")
@@ -279,6 +337,9 @@ class SASPipeline:
         self.be_output_dir = self.output_dir / "be_analysis"
         self.be_output_dir.mkdir(exist_ok=True)
         self.smallerror_bed = self.be_output_dir / "smallerror.bed"
+        self.smallerror_bed_windows = self.be_output_dir / "smallerror_50bp_windows.bed" if self.additional_bed_file else None
+        self.additional_bed_windows = self.be_output_dir / "additional_bed_windows.bed" if self.additional_bed_file else None
+        self.merged_50bp_windows = self.be_output_dir / "merged_50bp_windows.bed" if self.additional_bed_file else None
         self.hifi_filtered_regions = self.be_output_dir / "hifi_filtered_regions.txt"
         self.ont_filtered_regions = self.be_output_dir / "ont_filtered_regions.txt"
         self.merged_results = self.be_output_dir / "merged_results.txt"
@@ -394,7 +455,7 @@ class SASPipeline:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
-                cwd=cwd  # 不设置默认的cwd，让子进程在当前工作目录运行
+                cwd=cwd  # Don't set default cwd, let subprocess run in current working directory
             )
             
             if result.stdout:
@@ -410,6 +471,15 @@ class SASPipeline:
             self.logger.error(f"Return code: {e.returncode}")
             self.logger.error(f"STDOUT: {e.stdout}")
             self.logger.error(f"STDERR: {e.stderr}")
+            raise
+        except FileNotFoundError as e:
+            self.logger.error(f"Command not found: {description}")
+            self.logger.error(f"Error: {e}")
+            # Check if it's genmap
+            if 'genmap' in cmd_str[0].lower():
+                self.logger.error("genmap is not found in PATH. Please install genmap or add it to your PATH.")
+                self.logger.error("You can install genmap using: conda install -c bioconda genmap")
+                self.logger.error("Or download from: https://github.com/cpockrandt/genmap")
             raise
     
     def step1_filter_bam_files(self):
@@ -524,7 +594,7 @@ class SASPipeline:
             self.logger.info("Applying bed masking to small error regions")
             masked_smallerror_bed = self.be_output_dir / "smallerror_masked.bed"
             try:
-                self.bed_mask.apply_bedtools_intersect_v(
+                self.bed_mask.mask_bed_regions(
                     self.smallerror_bed, 
                     masked_smallerror_bed, 
                     "small error regions"
@@ -535,35 +605,109 @@ class SASPipeline:
                 self.logger.warning(f"Bed masking failed for small error regions: {e}")
                 self.logger.warning("Using original small error BED file without masking")
         
-        # Step 2b: Process with HiFi data (using smallerror_long.py)
-        self.logger.info("Step 2b: Processing candidate regions with HiFi data")
-        cmd = [
-            "python3",
-            str(self.scripts_dir / "smallerror_long.py"),
-            str(self.smallerror_bed),
-            str(self.hifi_filtered_bam),
-            str(self.reference_fa),
-            str(self.hifi_filtered_regions),
-            "--processes", str(self.threads)
-        ]
-        self._run_command(cmd, "Processing with HiFi data")
+        # Step 2a-extra: Generate IR bed file if requested
+        if self.generate_ir:
+            self.logger.info("Step 2a-extra: Generating IR (Identical Region) bed file")
+            self.logger.warning("WARNING: Using --generate-ir will significantly slow down the entire pipeline. "
+                             "IR generation is computationally intensive and the subsequent BE analysis with IR regions "
+                             "will also take longer.")
+            ir_bed_file = self._generate_ir_bed()
+            if ir_bed_file and ir_bed_file.exists():
+                self.additional_bed_file = ir_bed_file
+                # Set up paths for additional bed file processing
+                self.smallerror_bed_windows = self.be_output_dir / "smallerror_50bp_windows.bed"
+                self.additional_bed_windows = self.be_output_dir / "additional_bed_windows.bed"
+                self.merged_50bp_windows = self.be_output_dir / "merged_50bp_windows.bed"
+                self.logger.info(f"IR bed file generated: {ir_bed_file}")
+            else:
+                raise RuntimeError("Failed to generate IR bed file")
         
-        # Step 2c: Process with ONT data (using smallerror_long.py)
-        self.logger.info("Step 2c: Processing candidate regions with ONT data")
-        cmd = [
-            "python3",
-            str(self.scripts_dir / "smallerror_long.py"),
-            str(self.smallerror_bed),
-            str(self.ont_filtered_bam),
-            str(self.reference_fa),
-            str(self.ont_filtered_regions),
-            "--processes", str(self.threads)
-        ]
-        self._run_command(cmd, "Processing with ONT data")
+        # Step 2a-extra: Process additional bed file if provided
+        if self.additional_bed_file:
+            self.logger.info("Step 2a-extra: Processing additional bed file")
+            if not self.additional_bed_file.exists():
+                raise FileNotFoundError(f"Additional bed file not found: {self.additional_bed_file}")
+            
+            # Split smallerror_bed into 50bp windows
+            self.logger.info("Splitting smallerror_bed into 50bp windows")
+            self._split_bed_to_windows(
+                self.smallerror_bed,
+                self.smallerror_bed_windows,
+                window_size=50
+            )
+            
+            # Split additional bed file into 50bp windows
+            self.logger.info("Splitting additional bed file into 50bp windows")
+            self._split_bed_to_windows(
+                self.additional_bed_file,
+                self.additional_bed_windows,
+                window_size=50
+            )
+            
+            # Merge both 50bp windows BED files (merge adjacent windows with -d -1)
+            self.logger.info("Merging smallerror and additional bed 50bp windows (merging adjacent windows)")
+            self._merge_50bp_windows(
+                [self.smallerror_bed_windows, self.additional_bed_windows],
+                self.merged_50bp_windows
+            )
+            
+            # Step 2b: Process merged 50bp windows with HiFi data (output directly to hifi_filtered_regions.txt)
+            self.logger.info("Step 2b: Processing merged 50bp windows with HiFi data")
+            cmd = [
+                "python3",
+                str(self.scripts_dir / "smallerror_long.py"),
+                str(self.merged_50bp_windows),
+                str(self.hifi_filtered_bam),
+                str(self.reference_fa),
+                str(self.hifi_filtered_regions),
+                "--processes", str(self.threads)
+            ]
+            self._run_command(cmd, "Processing merged 50bp windows with HiFi data")
+            
+            # Step 2c: Process merged 50bp windows with ONT data (output directly to ont_filtered_regions.txt)
+            self.logger.info("Step 2c: Processing merged 50bp windows with ONT data")
+            cmd = [
+                "python3",
+                str(self.scripts_dir / "smallerror_long.py"),
+                str(self.merged_50bp_windows),
+                str(self.ont_filtered_bam),
+                str(self.reference_fa),
+                str(self.ont_filtered_regions),
+                "--processes", str(self.threads)
+            ]
+            self._run_command(cmd, "Processing merged 50bp windows with ONT data")
+        else:
+            # Step 2b: Process with HiFi data (using smallerror_long.py) - only when no additional bed file
+            self.logger.info("Step 2b: Processing candidate regions with HiFi data")
+            cmd = [
+                "python3",
+                str(self.scripts_dir / "smallerror_long.py"),
+                str(self.smallerror_bed),
+                str(self.hifi_filtered_bam),
+                str(self.reference_fa),
+                str(self.hifi_filtered_regions),
+                "--processes", str(self.threads)
+            ]
+            self._run_command(cmd, "Processing with HiFi data")
+            
+            # Step 2c: Process with ONT data (using smallerror_long.py) - only when no additional bed file
+            self.logger.info("Step 2c: Processing candidate regions with ONT data")
+            cmd = [
+                "python3",
+                str(self.scripts_dir / "smallerror_long.py"),
+                str(self.smallerror_bed),
+                str(self.ont_filtered_bam),
+                str(self.reference_fa),
+                str(self.ont_filtered_regions),
+                "--processes", str(self.threads)
+            ]
+            self._run_command(cmd, "Processing with ONT data")
         
         # Step 2d: Sort BED file and merge HiFi and ONT results
         self.logger.info("Step 2d: Sorting BED file and merging HiFi and ONT analysis results")
-        self._sort_bed_file()
+        # Skip sorting if using additional_bed_file (50bp windows are already in order)
+        if not self.additional_bed_file:
+            self._sort_bed_file()
         self._merge_hifi_ont_results()
         
         # Step 2e: Final BE filtering
@@ -604,11 +748,14 @@ class SASPipeline:
         """
         self.logger.info("Merging HiFi and ONT results...")
         
+        # Use merged 50bp windows BED file if additional_bed_file was provided, otherwise use smallerror_bed
+        bed_file_for_merge = self.merged_50bp_windows if self.additional_bed_file else self.smallerror_bed
+        
         # Use the existing merge_pileup.py script
         cmd = [
             "python3",
             str(self.scripts_dir / "merge_pileup.py"),
-            str(self.smallerror_bed),  # BED file with coordinates
+            str(bed_file_for_merge),  # BED file with coordinates (50bp windows or smallerror_bed)
             str(self.hifi_filtered_regions),  # File1 (HiFi results)
             str(self.ont_filtered_regions),   # File2 (ONT results)
             str(self.reference_fa),           # Reference FASTA file
@@ -619,6 +766,730 @@ class SASPipeline:
         
         self.logger.info(f"Merged results saved to: {self.merged_results}")
 
+    def _extract_haplotypes_from_diploid(self):
+        """
+        Extract maternal and paternal haplotypes from a diploid reference genome.
+        
+        Automatically detects the two most common chromosome suffix patterns (e.g., _MATERNAL/_PATERNAL,
+        _hap1/_hap2, etc.) and extracts chromosomes with these suffixes as the two haplotypes.
+        
+        Returns:
+            tuple: (mat_fasta_path, pat_fasta_path) or (None, None) if extraction fails
+        """
+        self.logger.info("Attempting to extract haplotypes from diploid reference genome...")
+        
+        # Get chromosomes from fai file
+        if not self.reference_fai.exists():
+            self.logger.warning("Reference FAI file not found, cannot extract haplotypes")
+            return None, None
+        
+        # Read all chromosomes and analyze suffix patterns
+        all_chroms = []
+        suffix_patterns = {}
+        no_suffix_chroms = []  # Chromosomes without underscore (e.g., chrEBV, chrM)
+        
+        with open(self.reference_fai, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) >= 1:
+                    chrom = parts[0]
+                    all_chroms.append(chrom)
+                    
+                    # Extract suffix (part after the last underscore)
+                    if '_' in chrom:
+                        suffix = chrom.split('_')[-1]
+                        if suffix not in suffix_patterns:
+                            suffix_patterns[suffix] = []
+                        suffix_patterns[suffix].append(chrom)
+                    else:
+                        # Chromosome without underscore suffix
+                        no_suffix_chroms.append(chrom)
+        
+        self.logger.info(f"Found {len(all_chroms)} chromosomes in total")
+        if no_suffix_chroms:
+            self.logger.info(f"Chromosomes without suffix (will be ignored): {no_suffix_chroms}")
+        self.logger.info(f"Detected suffix patterns: {list(suffix_patterns.keys())}")
+        
+        # Find the two most common suffix patterns (excluding chromosomes without suffix)
+        # Sort by count and take top 2
+        sorted_suffixes = sorted(suffix_patterns.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        if len(sorted_suffixes) < 2:
+            self.logger.warning(
+                f"Need at least 2 different suffix patterns to extract haplotypes. "
+                f"Found {len(sorted_suffixes)} pattern(s): {[s[0] for s in sorted_suffixes]}"
+            )
+            if no_suffix_chroms:
+                self.logger.warning(f"Also found {len(no_suffix_chroms)} chromosomes without suffix that were ignored")
+            return None, None
+        
+        # Get the two most common suffix patterns
+        suffix1, chroms1 = sorted_suffixes[0]
+        suffix2, chroms2 = sorted_suffixes[1]
+        
+        self.logger.info(
+            f"Using suffix patterns: '{suffix1}' ({len(chroms1)} chromosomes) and "
+            f"'{suffix2}' ({len(chroms2)} chromosomes)"
+        )
+        
+        # If there are more than 2 patterns, log a warning
+        if len(sorted_suffixes) > 2:
+            other_suffixes = [s[0] for s in sorted_suffixes[2:]]
+            self.logger.warning(
+                f"Found {len(sorted_suffixes)} suffix patterns. Using the two most common ones. "
+                f"Ignoring other patterns: {other_suffixes}"
+            )
+        
+        # Assign the two haplotypes (order doesn't matter for IR generation)
+        mat_chroms = chroms1
+        pat_chroms = chroms2
+        
+        # Create output directory for extracted haplotypes
+        haplotype_dir = self.be_output_dir / "ir_generation" / "extracted_haplotypes"
+        haplotype_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract maternal haplotype
+        mat_fasta = haplotype_dir / "mat_haplotype.fasta"
+        self.logger.info(f"Extracting maternal haplotype to {mat_fasta}...")
+        self._extract_chromosomes(self.reference_fa, mat_chroms, mat_fasta)
+        
+        # Extract paternal haplotype
+        pat_fasta = haplotype_dir / "pat_haplotype.fasta"
+        self.logger.info(f"Extracting paternal haplotype to {pat_fasta}...")
+        self._extract_chromosomes(self.reference_fa, pat_chroms, pat_fasta)
+        
+        self.logger.info("Successfully extracted haplotypes from diploid reference genome")
+        return mat_fasta, pat_fasta
+    
+    def _extract_chromosomes(self, input_fasta, chromosomes, output_fasta):
+        """
+        Extract specified chromosomes from a FASTA file.
+        
+        Args:
+            input_fasta: Path to input FASTA file
+            chromosomes: List of chromosome names to extract
+            output_fasta: Path to output FASTA file
+        """
+        self.logger.info(f"Extracting {len(chromosomes)} chromosomes from {input_fasta}...")
+        
+        # Use samtools faidx to extract chromosomes
+        with open(output_fasta, 'w') as fout:
+            for chrom in chromosomes:
+                cmd = ["samtools", "faidx", str(input_fasta), chrom]
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True
+                    )
+                    fout.write(result.stdout)
+                except subprocess.CalledProcessError as e:
+                    self.logger.warning(f"Failed to extract chromosome {chrom}: {e.stderr}")
+                    continue
+        
+        # Index the output FASTA
+        cmd_index = ["samtools", "faidx", str(output_fasta)]
+        subprocess.run(cmd_index, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        self.logger.info(f"Extracted chromosomes saved to {output_fasta}")
+
+    def _generate_ir_bed(self):
+        """
+        Generate IR (Identical Region) bed file using genmap on parental haplotypes.
+        
+        Process:
+        1. Split reference into parental haplotypes (mat and pat)
+        2. For each haplotype:
+           - Run genmap index
+           - Run genmap map
+           - Process with awk
+           - Merge with bedtools
+        3. Merge both haplotypes' results into final IR.bed
+        
+        Returns:
+            Path to generated IR.bed file
+        """
+        self.logger.info("Starting IR (Identical Region) generation...")
+        self.logger.warning("WARNING: IR generation is computationally intensive and may take several hours. "
+                         "This will also slow down the subsequent BE analysis as more regions need to be processed.")
+        
+        # Check if genmap is available by trying to run it
+        # Use both shutil.which and direct command execution to handle conda environments
+        genmap_path = shutil.which("genmap")
+        
+        # If not found in PATH, try to run genmap directly (it might be in conda environment)
+        if not genmap_path:
+            try:
+                # Try to run genmap --version to check if it's available
+                result = subprocess.run(
+                    ["genmap", "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                # If it runs successfully, use "genmap" as the command
+                genmap_path = "genmap"
+                self.logger.info("genmap found (via direct execution)")
+            except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+                # Try alternative: check if genmap is in common conda locations
+                import os
+                conda_prefix = os.environ.get("CONDA_PREFIX")
+                if conda_prefix:
+                    possible_paths = [
+                        os.path.join(conda_prefix, "bin", "genmap"),
+                        os.path.join(conda_prefix, "bin", "GenMap"),
+                    ]
+                    for path in possible_paths:
+                        if os.path.exists(path) and os.access(path, os.X_OK):
+                            genmap_path = path
+                            self.logger.info(f"Found genmap at: {genmap_path}")
+                            break
+                
+                if not genmap_path:
+                    error_msg = (
+                        "genmap is not found. Please ensure:\n"
+                        "  1. genmap is installed: conda install -c bioconda genmap\n"
+                        "  2. The correct conda environment is activated (the one containing genmap)\n"
+                        "  3. genmap is in your PATH\n"
+                        "Note: If you activated a conda environment with genmap, make sure to activate it "
+                        "before running the pipeline."
+                    )
+                    self.logger.error(error_msg)
+                    raise FileNotFoundError("genmap command not found. Please install genmap or activate the correct conda environment.")
+        
+        # Store genmap path as instance variable for use in _process_haplotype_for_ir
+        self._genmap_path = genmap_path
+        self.logger.info(f"Using genmap: {genmap_path}")
+        
+        # Create IR working directory
+        ir_work_dir = self.be_output_dir / "ir_generation"
+        ir_work_dir.mkdir(exist_ok=True)
+        
+        # Try to infer parental haplotype files from reference name
+        # Common patterns: hg002v0.9.mat-MT-EBV.fasta, hg002v0.9.pat-MT-EBV.fasta
+        ref_path = Path(self.reference_fa)
+        ref_dir = ref_path.parent
+        ref_name = ref_path.stem  # without .fasta extension
+        ref_base = ref_name.replace('.fasta', '').replace('.fa', '')
+        
+        # Try to find mat and pat files
+        mat_patterns = ['*mat*.fasta', '*mat*.fa', '*mat-MT-EBV.fasta', '*mat-MT-EBV.fa']
+        pat_patterns = ['*pat*.fasta', '*pat*.fa', '*pat-MT-EBV.fasta', '*pat-MT-EBV.fa']
+        
+        mat_fasta = None
+        pat_fasta = None
+        
+        # Search for mat file
+        for pattern in mat_patterns:
+            matches = list(ref_dir.glob(pattern))
+            if matches:
+                mat_fasta = matches[0]
+                break
+        
+        # Search for pat file
+        for pattern in pat_patterns:
+            matches = list(ref_dir.glob(pattern))
+            if matches:
+                pat_fasta = matches[0]
+                break
+        
+        # If not found, try to construct from reference name
+        if not mat_fasta or not pat_fasta:
+            # Try common naming patterns
+            possible_mat = ref_dir / f"{ref_base.replace('pat', 'mat')}.fasta"
+            possible_pat = ref_dir / f"{ref_base.replace('mat', 'pat')}.fasta"
+            
+            if not mat_fasta and possible_mat.exists():
+                mat_fasta = possible_mat
+            if not pat_fasta and possible_pat.exists():
+                pat_fasta = possible_pat
+        
+        # If still not found, try to extract from reference name directly
+        if not mat_fasta or not pat_fasta:
+            # Try to find files with mat/pat in the same directory
+            all_fastas = list(ref_dir.glob("*.fasta")) + list(ref_dir.glob("*.fa"))
+            for fa in all_fastas:
+                if 'mat' in fa.name.lower() and not mat_fasta:
+                    mat_fasta = fa
+                if 'pat' in fa.name.lower() and not pat_fasta:
+                    pat_fasta = fa
+        
+        # If not found, try to extract from diploid reference genome
+        if not mat_fasta or not pat_fasta:
+            self.logger.info("Parental haplotype files not found. Attempting to extract from diploid reference genome...")
+            mat_fasta, pat_fasta = self._extract_haplotypes_from_diploid()
+        
+        if not mat_fasta or not pat_fasta:
+            raise FileNotFoundError(
+                f"Could not find or extract parental haplotype files. "
+                f"Please ensure:\n"
+                f"  1. Mat and pat FASTA files are in the same directory as the reference, OR\n"
+                f"  2. The diploid reference contains chromosomes with '_MATERNAL' and '_PATERNAL' suffixes\n"
+                f"Reference: {self.reference_fa}, "
+                f"Directory: {ref_dir}"
+            )
+        
+        self.logger.info(f"Using maternal haplotype: {mat_fasta}")
+        self.logger.info(f"Using paternal haplotype: {pat_fasta}")
+        
+        # Process each haplotype
+        mat_ir_bed = self._process_haplotype_for_ir(mat_fasta, "mat", ir_work_dir)
+        pat_ir_bed = self._process_haplotype_for_ir(pat_fasta, "pat", ir_work_dir)
+        
+        # Merge both haplotypes' IR beds
+        final_ir_bed = self.be_output_dir / "IR.bed"
+        self.logger.info("Merging maternal and paternal IR beds...")
+        
+        try:
+            # Combine both beds
+            combined_bed = ir_work_dir / "combined_ir.tmp"
+            with open(combined_bed, 'w') as fout:
+                for bed_file in [mat_ir_bed, pat_ir_bed]:
+                    if bed_file and bed_file.exists():
+                        with open(bed_file, 'r') as fin:
+                            for line in fin:
+                                if line.strip() and not line.strip().startswith('#'):
+                                    fout.write(line)
+            
+            # Sort and merge
+            sorted_bed = ir_work_dir / "sorted_ir.tmp"
+            cmd_sort = [
+                "bedtools", "sort",
+                "-i", str(combined_bed),
+                "-faidx", str(self.reference_fai)
+            ]
+            with open(sorted_bed, 'w') as out_f:
+                subprocess.run(cmd_sort, check=True, stdout=out_f, stderr=subprocess.PIPE)
+            
+            # Merge overlapping regions
+            cmd_merge = [
+                "bedtools", "merge",
+                "-i", str(sorted_bed)
+            ]
+            with open(final_ir_bed, 'w') as out_f:
+                subprocess.run(cmd_merge, check=True, stdout=out_f, stderr=subprocess.PIPE)
+            
+            # Clean up temporary files
+            combined_bed.unlink()
+            sorted_bed.unlink()
+            
+            self.logger.info(f"IR bed file generated successfully: {final_ir_bed}")
+            return final_ir_bed
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Failed to merge IR beds: {e}")
+            raise
+        except FileNotFoundError:
+            self.logger.error("bedtools not found. Please install bedtools.")
+            raise
+    
+    def _process_haplotype_for_ir(self, fasta_file, haplotype_name, work_dir):
+        """
+        Process a single haplotype to generate IR bed file.
+        
+        Args:
+            fasta_file: Path to haplotype FASTA file
+            haplotype_name: Name of haplotype (e.g., 'mat', 'pat')
+            work_dir: Working directory for intermediate files
+        
+        Returns:
+            Path to generated IR bed file for this haplotype
+        """
+        self.logger.info(f"Processing {haplotype_name} haplotype for IR generation...")
+        
+        fasta_file = Path(fasta_file)
+        if not fasta_file.exists():
+            raise FileNotFoundError(f"Haplotype FASTA file not found: {fasta_file}")
+        
+        # Create haplotype-specific working directory
+        haplo_dir = work_dir / haplotype_name
+        haplo_dir.mkdir(exist_ok=True)
+        
+        # Step 1: Generate chromosome sizes file
+        chrom_sizes_file = haplo_dir / f"{haplotype_name}.chrom.sizes"
+        self.logger.info(f"Generating chromosome sizes for {haplotype_name}...")
+        cmd_faidx = ["samtools", "faidx", str(fasta_file)]
+        subprocess.run(cmd_faidx, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Extract chromosome sizes from .fai file
+        fai_file = Path(str(fasta_file) + ".fai")
+        if not fai_file.exists():
+            raise FileNotFoundError(f"FASTA index not found: {fai_file}")
+        
+        with open(fai_file, 'r') as fin, open(chrom_sizes_file, 'w') as fout:
+            for line in fin:
+                parts = line.strip().split('\t')
+                if len(parts) >= 2:
+                    chrom = parts[0]
+                    length = parts[1]
+                    fout.write(f"{chrom}\t{length}\n")
+        
+        # Step 2: Run genmap index
+        index_name = f"{haplotype_name}-index"
+        index_dir = haplo_dir / index_name
+        
+        # genmap index will create the directory itself, so we should not create it beforehand
+        # If it already exists (from a previous failed run), remove it first
+        if index_dir.exists():
+            self.logger.info(f"Removing existing index directory: {index_dir}")
+            shutil.rmtree(index_dir)
+        
+        self.logger.info(f"Running genmap index for {haplotype_name} (this may take a while)...")
+        # Get genmap path from the instance (set during _generate_ir_bed)
+        genmap_cmd = getattr(self, '_genmap_path', 'genmap')
+        
+        cmd_index = [
+            genmap_cmd, "index",
+            "-F", str(fasta_file),
+            "-I", str(index_dir)
+        ]
+        self._run_command(cmd_index, f"genmap index for {haplotype_name}")
+        
+        # Step 3: Run genmap map
+        genmap_output_dir = haplo_dir / "genmap_output"
+        genmap_output_dir.mkdir(exist_ok=True)
+        
+        self.logger.info(f"Running genmap map for {haplotype_name} (this may take a very long time)...")
+        # Get genmap path from the instance (set during _generate_ir_bed)
+        genmap_cmd = getattr(self, '_genmap_path', 'genmap')
+        
+        cmd_map = [
+            genmap_cmd, "map",
+            "-K", "150",
+            "-E", "0",
+            "-I", str(index_dir),
+            "-O", str(genmap_output_dir),
+            "-t", "-w", "-bg"
+        ]
+        self._run_command(cmd_map, f"genmap map for {haplotype_name}")
+        
+        # Find the bedgraph file (genmap map generates .bedgraph file)
+        bedgraph_files = list(genmap_output_dir.glob("*.bedgraph"))
+        if not bedgraph_files:
+            raise FileNotFoundError(f"No bedgraph file found in {genmap_output_dir}")
+        bedgraph_file = bedgraph_files[0]
+        
+        # Step 4: Process with awk
+        # awk 'NR==FNR{chr[$1]=$2; next} $4!=1{end=($3+150>chr[$1]?chr[$1]:$3+150); if(end>$2) print $1"\t"$2"\t"end}' chrom.sizes bedgraph | bedtools merge
+        self.logger.info(f"Processing {haplotype_name} bedgraph with awk...")
+        awk_processed = haplo_dir / f"{haplotype_name}_awk_processed.bed"
+        
+        # Run awk command
+        awk_cmd = [
+            "awk",
+            'NR==FNR{chr[$1]=$2; next} $4!=1{end=($3+150>chr[$1]?chr[$1]:$3+150); if(end>$2) print $1"\t"$2"\t"end}',
+            str(chrom_sizes_file),
+            str(bedgraph_file)
+        ]
+        
+        with open(awk_processed, 'w') as fout:
+            result = subprocess.run(
+                awk_cmd,
+                check=True,
+                stdout=fout,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+        
+        # Step 5: Merge with bedtools
+        ir_bed = haplo_dir / f"{haplotype_name}_IR.bed"
+        self.logger.info(f"Merging {haplotype_name} IR regions with bedtools...")
+        
+        cmd_merge = [
+            "bedtools", "merge",
+            "-i", str(awk_processed)
+        ]
+        
+        with open(ir_bed, 'w') as fout:
+            subprocess.run(cmd_merge, check=True, stdout=fout, stderr=subprocess.PIPE)
+        
+        self.logger.info(f"{haplotype_name} IR bed generated: {ir_bed}")
+        return ir_bed
+
+    def _split_bed_to_windows(self, input_bed, output_bed, window_size=50):
+        """
+        Split a BED file into windows of specified size (default 50bp).
+        Windows are aligned to window_size boundaries (e.g., 0, 50, 100, 150...).
+        Ensures windows don't exceed chromosome boundaries.
+        
+        Example: region 78-128 becomes windows 50-100 and 100-150
+        
+        Args:
+            input_bed: Path to input BED file
+            output_bed: Path to output BED file with windows
+            window_size: Size of windows in bp (default: 50)
+        """
+        self.logger.info(f"Splitting BED file into {window_size}bp windows (aligned to {window_size}bp boundaries): {input_bed}")
+        
+        # Get chromosome lengths
+        chr_lengths = self._get_chromosome_lengths()
+        
+        windows = []
+        total_regions = 0
+        total_windows = 0
+        
+        try:
+            with open(input_bed, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    parts = line.split('\t')
+                    if len(parts) < 3:
+                        continue
+                    
+                    chrom = parts[0]
+                    start = int(parts[1])
+                    end = int(parts[2])
+                    
+                    # Get chromosome length
+                    chr_len = chr_lengths.get(chrom, end)
+                    
+                    # Ensure end doesn't exceed chromosome length
+                    end = min(end, chr_len)
+                    
+                    if start >= end:
+                        continue
+                    
+                    total_regions += 1
+                    
+                    # Align start to window_size boundary (round down)
+                    aligned_start = (start // window_size) * window_size
+                    
+                    # Align end to window_size boundary (round up)
+                    aligned_end = ((end + window_size - 1) // window_size) * window_size
+                    
+                    # Ensure aligned_end doesn't exceed chromosome length
+                    aligned_end = min(aligned_end, chr_len)
+                    
+                    # Split region into aligned windows
+                    current_start = aligned_start
+                    while current_start < aligned_end:
+                        current_end = min(current_start + window_size, aligned_end, chr_len)
+                        if current_end > current_start:
+                            windows.append((chrom, current_start, current_end))
+                            total_windows += 1
+                        current_start = current_end
+            
+            # Write windows to output file
+            with open(output_bed, 'w') as f:
+                for chrom, start, end in windows:
+                    f.write(f"{chrom}\t{start}\t{end}\n")
+            
+            self.logger.info(f"Split {total_regions} regions into {total_windows} {window_size}bp windows (aligned to {window_size}bp boundaries)")
+            self.logger.info(f"Windows saved to: {output_bed}")
+            
+        except Exception as e:
+            self.logger.error(f"Error splitting BED file: {e}")
+            raise
+    
+    def _merge_bed_files(self, bed_files, output_bed):
+        """
+        Merge multiple BED files and remove duplicates.
+        
+        Args:
+            bed_files: List of BED file paths to merge
+            output_bed: Path to output merged BED file
+        """
+        self.logger.info(f"Merging {len(bed_files)} BED files...")
+        
+        try:
+            # Use bedtools merge if available
+            cmd = [
+                "bedtools", "sort",
+                "-faidx", str(self.reference_fai)
+            ]
+            
+            # Combine all bed files
+            combined_bed = self.be_output_dir / "combined_bed.tmp"
+            with open(combined_bed, 'w') as fout:
+                for bed_file in bed_files:
+                    if Path(bed_file).exists():
+                        with open(bed_file, 'r') as fin:
+                            for line in fin:
+                                if line.strip() and not line.strip().startswith('#'):
+                                    fout.write(line)
+            
+            # Sort and merge
+            cmd_merge = [
+                "bedtools", "sort",
+                "-i", str(combined_bed),
+                "-faidx", str(self.reference_fai)
+            ]
+            
+            sorted_bed = self.be_output_dir / "sorted_bed.tmp"
+            with open(sorted_bed, 'w') as out_f:
+                subprocess.run(cmd_merge, check=True, stdout=out_f, stderr=subprocess.PIPE)
+            
+            # Merge overlapping regions
+            cmd_merge_final = [
+                "bedtools", "merge",
+                "-i", str(sorted_bed)
+            ]
+            
+            with open(output_bed, 'w') as out_f:
+                subprocess.run(cmd_merge_final, check=True, stdout=out_f, stderr=subprocess.PIPE)
+            
+            # Clean up temporary files
+            combined_bed.unlink()
+            sorted_bed.unlink()
+            
+            # Count merged regions
+            merged_count = sum(1 for _ in open(output_bed))
+            self.logger.info(f"Merged BED file contains {merged_count} regions: {output_bed}")
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"bedtools merge failed: {e}")
+            # Fallback to simple concatenation and Python-based merge
+            self._merge_bed_files_python(bed_files, output_bed)
+        except FileNotFoundError:
+            self.logger.warning("bedtools not found, using Python-based merge")
+            self._merge_bed_files_python(bed_files, output_bed)
+    
+    def _merge_50bp_windows(self, bed_files, output_bed):
+        """
+        Merge 50bp windows BED files, merging adjacent windows using bedtools merge -d -1.
+        
+        Args:
+            bed_files: List of BED file paths containing 50bp windows
+            output_bed: Path to output merged BED file
+        """
+        self.logger.info(f"Merging {len(bed_files)} 50bp windows BED files (merging adjacent windows with -d -1)...")
+        
+        try:
+            # Combine all bed files
+            combined_bed = self.be_output_dir / "combined_50bp_windows.tmp"
+            with open(combined_bed, 'w') as fout:
+                for bed_file in bed_files:
+                    if Path(bed_file).exists():
+                        with open(bed_file, 'r') as fin:
+                            for line in fin:
+                                if line.strip() and not line.strip().startswith('#'):
+                                    fout.write(line)
+            
+            # Sort using bedtools
+            cmd_sort = [
+                "bedtools", "sort",
+                "-i", str(combined_bed),
+                "-faidx", str(self.reference_fai)
+            ]
+            
+            sorted_bed = self.be_output_dir / "sorted_50bp_windows.tmp"
+            with open(sorted_bed, 'w') as out_f:
+                subprocess.run(cmd_sort, check=True, stdout=out_f, stderr=subprocess.PIPE)
+            
+            # Merge adjacent windows using -d -1 (merge windows that are adjacent or overlapping)
+            cmd_merge = [
+                "bedtools", "merge",
+                "-i", str(sorted_bed),
+                "-d", "-1"  # -d -1 means merge adjacent windows (distance <= -1, i.e., adjacent or overlapping)
+            ]
+            
+            with open(output_bed, 'w') as out_f:
+                subprocess.run(cmd_merge, check=True, stdout=out_f, stderr=subprocess.PIPE)
+            
+            # Clean up temporary files
+            combined_bed.unlink()
+            sorted_bed.unlink()
+            
+            # Count merged regions
+            merged_count = sum(1 for _ in open(output_bed))
+            self.logger.info(f"Merged 50bp windows BED file contains {merged_count} regions: {output_bed}")
+            
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"bedtools merge failed: {e}")
+            # Fallback to Python-based merge with adjacent window merging
+            self._merge_50bp_windows_python(bed_files, output_bed)
+        except FileNotFoundError:
+            self.logger.warning("bedtools not found, using Python-based merge for 50bp windows")
+            self._merge_50bp_windows_python(bed_files, output_bed)
+    
+    def _merge_50bp_windows_python(self, bed_files, output_bed):
+        """
+        Python-based 50bp windows merging (fallback when bedtools is not available).
+        Merges adjacent windows (distance <= 0).
+        """
+        self.logger.info("Using Python-based 50bp windows merging...")
+        
+        regions = []
+        
+        for bed_file in bed_files:
+            if not Path(bed_file).exists():
+                continue
+            with open(bed_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split('\t')
+                        if len(parts) >= 3:
+                            chrom = parts[0]
+                            start = int(parts[1])
+                            end = int(parts[2])
+                            regions.append((chrom, start, end))
+        
+        # Sort regions
+        sorted_regions = sorted(regions, key=lambda x: (x[0], x[1]))
+        
+        # Merge adjacent or overlapping regions (distance <= 0)
+        merged = []
+        for chrom, start, end in sorted_regions:
+            if merged and merged[-1][0] == chrom and merged[-1][2] >= start:
+                # Merge with previous region (adjacent or overlapping)
+                merged[-1] = (chrom, merged[-1][1], max(merged[-1][2], end))
+            else:
+                merged.append((chrom, start, end))
+        
+        # Write merged regions
+        with open(output_bed, 'w') as f:
+            for chrom, start, end in merged:
+                f.write(f"{chrom}\t{start}\t{end}\n")
+        
+        self.logger.info(f"Merged {len(merged)} regions from 50bp windows: {output_bed}")
+    
+    def _merge_bed_files_python(self, bed_files, output_bed):
+        """
+        Python-based BED file merging (fallback when bedtools is not available).
+        """
+        self.logger.info("Using Python-based BED merging...")
+        
+        regions = set()
+        
+        for bed_file in bed_files:
+            if not Path(bed_file).exists():
+                continue
+            with open(bed_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split('\t')
+                        if len(parts) >= 3:
+                            chrom = parts[0]
+                            start = int(parts[1])
+                            end = int(parts[2])
+                            regions.add((chrom, start, end))
+        
+        # Sort regions
+        sorted_regions = sorted(regions, key=lambda x: (x[0], x[1]))
+        
+        # Merge overlapping regions
+        merged = []
+        for chrom, start, end in sorted_regions:
+            if merged and merged[-1][0] == chrom and merged[-1][2] >= start:
+                # Merge with previous region
+                merged[-1] = (chrom, merged[-1][1], max(merged[-1][2], end))
+            else:
+                merged.append((chrom, start, end))
+        
+        # Write merged regions
+        with open(output_bed, 'w') as f:
+            for chrom, start, end in merged:
+                f.write(f"{chrom}\t{start}\t{end}\n")
+        
+        self.logger.info(f"Merged {len(merged)} regions: {output_bed}")
+    
     def _sort_bed_file(self):
         """
         Sort the BED file by chromosome and position for consistent ordering.
@@ -1056,6 +1927,8 @@ class SASPipeline:
             f.write(f"Run SE Analysis: {self.run_se_analysis}\n")
             if self.bed_files:
                 f.write(f"Bed Masking: {len(self.bed_files)} files\n")
+            if self.additional_bed_file:
+                f.write(f"Additional Bed File for BE Analysis: {self.additional_bed_file}\n")
             f.write("\n")
             
             f.write("Input Files:\n")
@@ -1070,6 +1943,8 @@ class SASPipeline:
                 f.write("  Bed Mask Files:\n")
                 for bed_file in self.bed_files:
                     f.write(f"    {bed_file}\n")
+            if self.additional_bed_file:
+                f.write(f"  Additional Bed File (split into 50bp windows): {self.additional_bed_file}\n")
             f.write("\n")
             
             f.write("Output Files:\n")
@@ -1250,7 +2125,9 @@ def create_config_from_args(args):
         'run_se_analysis': args.run_se_analysis,
         'se_window_size': args.se_window_size,
         'se_min_indel_length': args.se_min_indel_length,
-        'bed_files': args.bed_files
+        'bed_files': args.bed_files,
+        'additional_bed_file': getattr(args, 'additional_bed_file', None),
+        'generate_ir': getattr(args, 'generate_ir', False)
     }
     
     # Add reference_fai if provided
@@ -1292,6 +2169,12 @@ def validate_input_files(config):
             bed_path = Path(bed_file)
             if not bed_path.exists():
                 raise FileNotFoundError(f"Bed file not found: {bed_path}")
+    
+    # Check additional bed file if provided
+    if 'additional_bed_file' in config and config['additional_bed_file']:
+        additional_bed_path = Path(config['additional_bed_file'])
+        if not additional_bed_path.exists():
+            raise FileNotFoundError(f"Additional bed file not found: {additional_bed_path}")
     
     # Check scripts directory
     scripts_dir = Path(config['scripts_dir'])
@@ -1374,6 +2257,16 @@ Examples:
     --reference-fa reference.fa \\
     --output-dir results \\
     --bed-files mask1.bed mask2.bed \\
+    --threads 32
+
+  # Run with additional bed file for BE analysis
+  python3 sas_pipeline.py \\
+    --short-read-bam illumina.bam \\
+    --hifi-bam hifi.bam \\
+    --ont-bam ont.bam \\
+    --reference-fa reference.fa \\
+    --output-dir results \\
+    --additional-bed-file candidate_regions.bed \\
     --threads 32
 
 Output Structure:
@@ -1487,6 +2380,24 @@ Output Structure:
         "--bed-files",
         nargs="+",
         help="Paths to bed files for masking (e.g., chr1.bed chr2.bed). Multiple files are allowed."
+    )
+    
+    # Additional bed file for BE analysis
+    parser.add_argument(
+        "--additional-bed-file",
+        help="Path to an additional bed file that will be split into 50bp windows and merged with low-coverage regions for BE analysis"
+    )
+    
+    # IR (Identical Region) generation option
+    parser.add_argument(
+        "--generate-ir",
+        action="store_true",
+        help="Generate IR (Identical Region) bed file automatically using genmap on parental haplotypes. "
+             "This option will automatically detect mat and pat FASTA files from the reference directory. "
+             "WARNING: Using this option will significantly slow down the ENTIRE pipeline. "
+             "IR generation itself is computationally intensive (may take several hours), and the subsequent "
+             "BE analysis will also be slower as it needs to process additional IR regions. "
+             "IR regions are used to re-analyze regions where read mapping may be inaccurate using HiFi and ONT data."
     )
     
     parser.add_argument(

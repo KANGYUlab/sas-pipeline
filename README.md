@@ -13,6 +13,27 @@ The SAS algorithm employs a dual-approach strategy with technology-specific opti
 
 
 
+### IR (Identical Region) Generation
+
+The `--generate-ir` option automatically generates an IR (Identical Region) bed file using genmap on parental haplotypes. This process:
+
+1. **Automatically detects or extracts parental haplotypes**: 
+   - First searches for separate mat and pat FASTA files in the reference directory
+   - If not found, automatically extracts haplotypes from the diploid reference genome by detecting chromosome suffix patterns (e.g., `_MATERNAL`/`_PATERNAL`, `_hap1`/`_hap2`, etc.)
+   - The two most common suffix patterns are automatically identified and used to split the diploid genome into two haplotypes
+2. **Runs genmap on each haplotype**:
+   - `genmap index` to build the index
+   - `genmap map -K 150 -E 0` to map k-mers
+3. **Processes results**: Uses awk to filter and extend regions, then merges with bedtools
+4. **Merges both haplotypes**: Combines mat and pat IR regions into a single IR.bed file
+
+**Important Notes:**
+- **WARNING: Using --generate-ir will significantly slow down the ENTIRE pipeline.** 
+  - The subsequent BE analysis will be slower as it needs to process additional IR regions
+- IR regions are regions where short reads may be inaccurate mapped due to identical sequence
+- The generated IR.bed is automatically used as the additional bed file for BE analysis
+- These regions are re-analyzed using HiFi and ONT data to improve accuracy
+
 ### Detailed Detection Methodology
 
 #### 1. **BE (Base-level Errors) Detection**
@@ -86,6 +107,7 @@ QV_SAS = -10 × log₁₀((SE_windows + BE_windows) / Assembly_Length)
 - `samtools` (v1.10+)
 - `bedtools` (v2.25+)
 - `mosdepth` (v0.3.0+, for SE analysis)
+- `genmap` (required only if using `--generate-ir` option for IR generation)
 
 ### System Dependencies
 
@@ -145,6 +167,10 @@ conda activate sas-pipeline
 # Or if using mamba (faster)
 mamba create -n sas-pipeline python=3.8 samtools bedtools mosdepth -c bioconda
 mamba activate sas-pipeline
+
+# If you plan to use --generate-ir option, also install genmap:
+conda install -c bioconda genmap
+# Note: Using --generate-ir will significantly slow down the entire pipeline
 ```
 
 ### Python Dependencies
@@ -240,6 +266,18 @@ python src/sas_pipeline.py \
   --threads 64 \
   --se-window-size 2000 \
   --se-min-indel-length 50
+
+  # Run with automatic IR (Identical Region) generation
+  # WARNING: This will significantly slow down the ENTIRE pipeline (several hours for IR generation + slower BE analysis)
+  # The pipeline will automatically detect mat and pat FASTA files, or extract haplotypes from the diploid reference genome
+python src/sas_pipeline.py \
+  --short-read-bam illumina.bam \
+  --hifi-bam hifi.bam \
+  --ont-bam ont.bam \
+  --reference-fa reference.fa \
+  --output-dir results \
+  --generate-ir \
+  --threads 32
 ```
 
 ## Parameters Reference
@@ -285,6 +323,13 @@ python src/sas_pipeline.py \
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `--bed-files` | string(s) | None | Paths to bed files for masking (e.g., `chr1.bed chr2.bed`). Multiple files are allowed. Regions in these files will be excluded from analysis. |
+
+#### IR (Identical Region) Generation Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--generate-ir` | flag | False | **Automatically generate IR (Identical Region) bed file** using genmap on parental haplotypes. This option will automatically detect mat and pat FASTA files from the reference directory, or if not found, extract haplotypes from the diploid reference genome by detecting chromosome suffix patterns (e.g., `_MATERNAL`/`_PATERNAL`, `_hap1`/`_hap2`). **WARNING: Using this option will significantly slow down the ENTIRE pipeline.** IR generation itself is computationally intensive (may take several hours), and the subsequent BE analysis will also be slower as it needs to process additional IR regions. IR regions are used to re-analyze regions where read mapping may be inaccurate using HiFi and ONT data. When enabled, the generated IR.bed will be automatically used as the additional bed file for BE analysis. |
+| `--additional-bed-file` | string | None | Path to an additional bed file that will be split into 50bp windows and merged with low-coverage regions for BE analysis. If `--generate-ir` is enabled, this option is ignored (IR.bed will be used instead). |
 
 #### Information
 

@@ -9,8 +9,13 @@ from reference genome sequences.
 
 import sys
 import argparse
-from collections import defaultdict, Counter
+from collections import defaultdict
 from pathlib import Path
+try:
+    import pysam
+    PYSAM_AVAILABLE = True
+except ImportError:
+    PYSAM_AVAILABLE = False
 
 
 class BedFileMerger:
@@ -21,6 +26,8 @@ class BedFileMerger:
         self.file1_data = {}
         self.file2_data = {}
         self.ref_sequences = {}
+        self.ref_file_path = None
+        self.ref_fasta = None  # pysam FastaFile handle
         
     def merge_files(self, bed_file: str, file1: str, file2: str, ref_file: str, output_file: str) -> None:
         """
@@ -49,10 +56,25 @@ class BedFileMerger:
         self._read_data_file(file2, self.file2_data, skip_header=False)
         
         print(f"Loading reference sequences: {ref_file}")
-        self._load_reference_sequences(ref_file)
+        self.ref_file_path = ref_file
+        # Try to use pysam for faster access, fallback to loading all sequences
+        if PYSAM_AVAILABLE:
+            try:
+                self.ref_fasta = pysam.FastaFile(ref_file)
+                print(f"Using pysam for on-demand sequence extraction (memory efficient)")
+            except Exception as e:
+                print(f"Warning: Could not open reference with pysam: {e}")
+                print("Falling back to loading all sequences into memory")
+                self._load_reference_sequences(ref_file)
+        else:
+            self._load_reference_sequences(ref_file)
         
         print(f"Merging files and calculating base composition: {output_file}")
         self._write_merged_file(output_file)
+        
+        # Close pysam handle if used
+        if self.ref_fasta:
+            self.ref_fasta.close()
         
     def _read_bed_file(self, filename: str) -> None:
         """Read the BED format file."""
@@ -153,36 +175,41 @@ class BedFileMerger:
         
     def _calculate_base_ratios(self, chr_name: str, start: int, end: int) -> tuple:
         """Calculate base composition ratios for a genomic region."""
-        if chr_name not in self.ref_sequences:
-            print(f"Warning: Chromosome {chr_name} not found in reference")
-            return (0.0, 0.0, 0.0)
+        try:
+            # Use pysam for on-demand sequence extraction if available
+            if self.ref_fasta:
+                try:
+                    subseq = self.ref_fasta.fetch(chr_name, start, end).upper()
+                except (KeyError, ValueError) as e:
+                    # Chromosome not found or invalid coordinates
+                    return (0.0, 0.0, 0.0)
+            else:
+                # Fallback to loaded sequences
+                if chr_name not in self.ref_sequences:
+                    return (0.0, 0.0, 0.0)
+                sequence = self.ref_sequences[chr_name]
+                if start >= len(sequence) or end > len(sequence) or start >= end:
+                    return (0.0, 0.0, 0.0)
+                subseq = sequence[start:end]
             
-        sequence = self.ref_sequences[chr_name]
-        
-        # Extract subsequence (convert to 0-based indexing)
-        if start >= len(sequence) or end > len(sequence) or start >= end:
-            print(f"Warning: Invalid coordinates {chr_name}:{start}-{end}")
-            return (0.0, 0.0, 0.0)
+            total = len(subseq)
+            if total == 0:
+                return (0.0, 0.0, 0.0)
             
-        subseq = sequence[start:end]
-        
-        # Count bases
-        base_counts = Counter(subseq)
-        total = len(subseq)
-        
-        if total == 0:
+            # Use string count method (faster than Counter for small sequences)
+            a_count = subseq.count('A')
+            t_count = subseq.count('T')
+            c_count = subseq.count('C')
+            g_count = subseq.count('G')
+            
+            ag_ratio = (a_count + g_count) / total
+            ct_ratio = (c_count + t_count) / total
+            gc_ratio = (g_count + c_count) / total
+            
+            return (ag_ratio, ct_ratio, gc_ratio)
+        except Exception as e:
+            # Silent fallback on errors
             return (0.0, 0.0, 0.0)
-        
-        a_count = base_counts.get('A', 0)
-        t_count = base_counts.get('T', 0)
-        c_count = base_counts.get('C', 0)
-        g_count = base_counts.get('G', 0)
-        
-        ag_ratio = (a_count + g_count) / total
-        ct_ratio = (c_count + t_count) / total
-        gc_ratio = (g_count + c_count) / total
-        
-        return (ag_ratio, ct_ratio, gc_ratio)
         
     def _write_merged_file(self, output_file: str) -> None:
         """Write the merged output file with base composition ratios."""
@@ -191,6 +218,19 @@ class BedFileMerger:
         # Create output directory if it doesn't exist
         output_dir = Path(output_file).parent
         output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Group regions by chromosome for better cache locality
+        regions_by_chr = defaultdict(list)
+        for key in self.reference_data.keys():
+            chr_name, start, end = key
+            regions_by_chr[chr_name].append((key, start, end))
+        
+        # Sort regions within each chromosome by start position for better locality
+        for chr_name in regions_by_chr:
+            regions_by_chr[chr_name].sort(key=lambda x: x[1])
+        
+        total_regions = len(self.reference_data)
+        processed = 0
         
         with open(output_file, 'w', encoding='utf-8') as f:
             # Write header
@@ -202,32 +242,36 @@ class BedFileMerger:
             ]
             f.write('\t'.join(header) + '\n')
             
-            # Process each region in BED file
-            for key in self.reference_data.keys():
-                chr_name, start, end = key
-                
-                # Get data from file1 (or default to -1)
-                file1_cols = self.file1_data.get(key, ("-1", "-1"))
-                file1_col1, file1_col2 = file1_cols
-                
-                # Get data from file2 (or default to -1)
-                file2_cols = self.file2_data.get(key, ("-1", "-1"))
-                file2_col1, file2_col2 = file2_cols
-                
-                # Calculate base composition ratios
-                ag_ratio, ct_ratio, gc_ratio = self._calculate_base_ratios(chr_name, start, end)
-                
-                # Write merged line
-                output_line = (
-                    f"{chr_name}\t{start}\t{end}\t"
-                    f"{file1_col1}\t{file1_col2}\t"
-                    f"{file2_col1}\t{file2_col2}\t"
-                    f"{ag_ratio:.4f}\t{ct_ratio:.4f}\t{gc_ratio:.4f}\n"
-                )
-                f.write(output_line)
+            # Process regions grouped by chromosome
+            for chr_name in sorted(regions_by_chr.keys()):
+                for key, start, end in regions_by_chr[chr_name]:
+                    # Get data from file1 (or default to -1)
+                    file1_cols = self.file1_data.get(key, ("-1", "-1"))
+                    file1_col1, file1_col2 = file1_cols
+                    
+                    # Get data from file2 (or default to -1)
+                    file2_cols = self.file2_data.get(key, ("-1", "-1"))
+                    file2_col1, file2_col2 = file2_cols
+                    
+                    # Calculate base composition ratios
+                    ag_ratio, ct_ratio, gc_ratio = self._calculate_base_ratios(chr_name, start, end)
+                    
+                    # Write merged line
+                    output_line = (
+                        f"{chr_name}\t{start}\t{end}\t"
+                        f"{file1_col1}\t{file1_col2}\t"
+                        f"{file2_col1}\t{file2_col2}\t"
+                        f"{ag_ratio:.4f}\t{ct_ratio:.4f}\t{gc_ratio:.4f}\n"
+                    )
+                    f.write(output_line)
+                    
+                    processed += 1
+                    # Progress update every 10000 regions
+                    if processed % 10000 == 0:
+                        print(f"Processed {processed}/{total_regions} regions ({100.0 * processed / total_regions:.1f}%)")
                 
         print(f"Merged file written successfully: {output_file}")
-        print(f"Total regions processed: {len(self.reference_data)}")
+        print(f"Total regions processed: {processed}")
 
 
 def create_parser() -> argparse.ArgumentParser:

@@ -79,6 +79,8 @@ def filter_data(data_file, fai_file, output_file=None, exclude_mode=False, sep='
     """
     Main data filtering function
     """
+    HIGH_DEPTH_THRESHOLD = 1000.0
+
     # Load chromosome length information
     chr_lengths = load_fai(fai_file)
     print(f"Loaded length information for {len(chr_lengths)} chromosomes")
@@ -97,12 +99,26 @@ def filter_data(data_file, fai_file, output_file=None, exclude_mode=False, sep='
     
     # Filter data
     filtered_indices = []
+    high_depth_skipped = 0
     
     for idx, row in df.iterrows():
         try:
             chr_name = str(row[0])
             start = int(row[1])
             end = int(row[2])
+
+            # Skip rows where any platform reports excessively high depth
+            try:
+                platform1_depth = float(row[4])
+                platform2_depth = float(row[6])
+            except (ValueError, TypeError):
+                platform1_depth = float('nan')
+                platform2_depth = float('nan')
+
+            if (not pd.isna(platform1_depth) and platform1_depth > HIGH_DEPTH_THRESHOLD) or \
+               (not pd.isna(platform2_depth) and platform2_depth > HIGH_DEPTH_THRESHOLD):
+                high_depth_skipped += 1
+                continue
             
             # Check if in terminal 10kb regions
             if is_in_terminal_region(chr_name, start, end, chr_lengths):
@@ -128,6 +144,8 @@ def filter_data(data_file, fai_file, output_file=None, exclude_mode=False, sep='
     filtered_df = df.iloc[filtered_indices]
     
     print(f"Filtered result contains {len(filtered_df)} rows")
+    if high_depth_skipped > 0:
+        print(f"Skipped {high_depth_skipped} rows due to depth > {HIGH_DEPTH_THRESHOLD}")
     
     # Output results
     if output_file:
