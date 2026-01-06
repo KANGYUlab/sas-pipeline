@@ -9,30 +9,8 @@ SAS (Sufficient Alignment Support) is a comprehensive toolkit for systematically
 
 The SAS algorithm employs a dual-approach strategy with technology-specific optimizations:
 - **BE (Base-level Errors)**: Detected in 50bp windows using high-precision reads from all platforms
-- **SE (Structural Errors)**: Identified in 2kb windows using ultra-long ONT reads 
-
-
-
-### IR (Identical Regions) re-analyze
-
-IR (Identical Regions) are regions where short reads may be inaccurate mapped due to identical sequence.
-
-The `--generate-ir` option automatically generates an IR bed file using genmap on parental haplotypes and re-analyzed using HiFi and ONT data to improve accuracy . This process:
-
-1. **Automatically detects or extracts parental haplotypes**: 
-   - First searches for separate mat and pat FASTA files in the reference directory
-   - If not found, automatically extracts haplotypes from the diploid reference genome by detecting chromosome suffix patterns (e.g., `_MATERNAL`/`_PATERNAL`, `_hap1`/`_hap2`, etc.)
-   - The two most common suffix patterns are automatically identified and used to split the diploid genome into two haplotypes
-2. **Runs genmap on each haplotype**:
-   - `genmap index` to build the index
-   - `genmap map -K 150 -E 0` to map k-mers
-3. **Processes results**: Uses awk to filter and extend regions, then merges with bedtools
-4. **Merges both haplotypes**: Combines mat and pat IR regions into a single IR.bed file
-
-**Important Notes:**
-- **WARNING: Using --generate-ir will significantly slow down the ENTIRE pipeline.** 
-  - The subsequent BE analysis will be slower as it needs to process additional IR regions
-- The generated IR.bed is automatically used as the additional bed file for BE analysis
+- **SE (Structural Errors)**: Identified in 2kb windows using ultra-long ONT reads
+- 
 
 ### Detailed Detection Methodology
 
@@ -98,7 +76,26 @@ QV_SAS = -10 × log₁₀((SE_windows + BE_windows) / Assembly_Length)
 - **BE_windows**: Number of 50bp windows flagged as base-level errors  
 - **Assembly_Length**: Total length of the reference assembly (in bases)
 
+### IR (Identical Regions) re-analyze
 
+IR (Identical Regions) are regions where short reads may be inaccurate mapped due to identical sequence.
+
+The `--generate-ir` option automatically generates an IR bed file using genmap on parental haplotypes and re-analyzed using HiFi and ONT data to improve accuracy . This process:
+
+1. **Automatically detects or extracts parental haplotypes**: 
+   - First searches for separate mat and pat FASTA files in the reference directory
+   - If not found, automatically extracts haplotypes from the diploid reference genome by detecting chromosome suffix patterns (e.g., `_MATERNAL`/`_PATERNAL`, `_hap1`/`_hap2`, etc.)
+   - The two most common suffix patterns are automatically identified and used to split the diploid genome into two haplotypes
+2. **Runs genmap on each haplotype**:
+   - `genmap index` to build the index
+   - `genmap map -K 150 -E 0` to map k-mers
+3. **Processes results**: Uses awk to filter and extend regions, then merges with bedtools
+4. **Merges both haplotypes**: Combines mat and pat IR regions into a single IR.bed file
+
+**Important Notes:**
+- **WARNING: Using --generate-ir will significantly slow down the ENTIRE pipeline.** 
+  - The subsequent BE analysis will be slower as it needs to process additional IR regions
+- The generated IR.bed is automatically used as the additional bed file for BE analysis
 
 
 ## Installation
@@ -374,6 +371,7 @@ results/
 If you use the SAS method in your research, please cite:
 
 Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang, Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao, Yu Kang. Approaching an Error-Free Diploid Human Genome. bioRxiv. doi: https://doi.org/10.1101/2025.08.01.667781
+
 
 
 
