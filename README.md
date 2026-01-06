@@ -15,7 +15,8 @@ The SAS algorithm employs a dual-approach strategy with technology-specific opti
 
 ### IR (Identical Region) re-analyze
 
-IR regions are regions where short reads may be inaccurate mapped due to identical sequence
+IR(Identical Region) regions are regions where short reads may be inaccurate mapped due to identical sequence.
+
 The `--generate-ir` option automatically generates an IR bed file using genmap on parental haplotypes and re-analyzed using HiFi and ONT data to improve accuracy . This process:
 
 1. **Automatically detects or extracts parental haplotypes**: 
@@ -373,5 +374,6 @@ results/
 If you use the SAS method in your research, please cite:
 
 Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang, Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao, Yu Kang. Approaching an Error-Free Diploid Human Genome. bioRxiv. doi: https://doi.org/10.1101/2025.08.01.667781
+
 
 
