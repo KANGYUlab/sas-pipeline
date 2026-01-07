@@ -589,9 +589,9 @@ class SASPipeline:
         else:
             raise FileNotFoundError(f"Expected smallerror BED file not found: {expected_bed}")
         
-        # Apply bed masking if enabled
+        # Apply bed masking if enabled - MUST be done before long platform analysis
         if self.bed_mask:
-            self.logger.info("Applying bed masking to small error regions")
+            self.logger.info("Applying bed masking to small error regions (before long platform analysis)")
             masked_smallerror_bed = self.be_output_dir / "smallerror_masked.bed"
             try:
                 self.bed_mask.mask_bed_regions(
@@ -599,8 +599,9 @@ class SASPipeline:
                     masked_smallerror_bed, 
                     "small error regions"
                 )
-                # Use the masked version for further processing
+                # Replace the original smallerror.bed with masked version for all subsequent processing
                 self.smallerror_bed = masked_smallerror_bed
+                self.logger.info(f"Bed masking completed. Using masked BED file for long platform analysis: {self.smallerror_bed}")
             except Exception as e:
                 self.logger.warning(f"Bed masking failed for small error regions: {e}")
                 self.logger.warning("Using original small error BED file without masking")
@@ -678,7 +679,10 @@ class SASPipeline:
             self._run_command(cmd, "Processing merged 50bp windows with ONT data")
         else:
             # Step 2b: Process with HiFi data (using smallerror_long.py) - only when no additional bed file
+            # Note: self.smallerror_bed is already masked if bed_mask is enabled
             self.logger.info("Step 2b: Processing candidate regions with HiFi data")
+            if self.bed_mask:
+                self.logger.info(f"Using masked BED file for HiFi analysis: {self.smallerror_bed}")
             cmd = [
                 "python3",
                 str(self.scripts_dir / "smallerror_long.py"),
@@ -691,7 +695,10 @@ class SASPipeline:
             self._run_command(cmd, "Processing with HiFi data")
             
             # Step 2c: Process with ONT data (using smallerror_long.py) - only when no additional bed file
+            # Note: self.smallerror_bed is already masked if bed_mask is enabled
             self.logger.info("Step 2c: Processing candidate regions with ONT data")
+            if self.bed_mask:
+                self.logger.info(f"Using masked BED file for ONT analysis: {self.smallerror_bed}")
             cmd = [
                 "python3",
                 str(self.scripts_dir / "smallerror_long.py"),
