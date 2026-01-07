@@ -121,10 +121,23 @@ wget https://github.com/brentp/mosdepth/releases/download/v0.3.3/mosdepth
 chmod +x mosdepth
 sudo mv mosdepth /usr/local/bin/
 
+# Install genmap (required only if using --generate-ir option)
+# Option 1: Using conda (recommended)
+conda install -c bioconda genmap
+
+# Option 2: Download pre-built binary
+# Download from: https://github.com/cpockrandt/genmap/releases
+# For Linux 64-bit optimized (requires SSE4):
+wget https://github.com/cpockrandt/genmap/releases/download/genmap-v1.3.0/genmap-1.3.0-Linux-x86_64-sse4.zip
+unzip genmap-1.3.0-Linux-x86_64-sse4.zip
+chmod +x genmap-1.3.0-Linux-x86_64-sse4/bin/genmap
+sudo mv genmap-1.3.0-Linux-x86_64-sse4/bin/genmap /usr/local/bin/
+
 # Verify installations
 samtools --version
 bedtools --version
 mosdepth --version
+genmap --help  # Verify genmap if installed
 ```
 
 **CentOS/RHEL/Rocky Linux:**
@@ -139,6 +152,17 @@ sudo yum install -y samtools bedtools
 wget https://github.com/brentp/mosdepth/releases/download/v0.3.3/mosdepth
 chmod +x mosdepth
 sudo mv mosdepth /usr/local/bin/
+
+# Install genmap (required only if using --generate-ir option)
+# Option 1: Using conda (recommended)
+conda install -c bioconda genmap
+
+# Option 2: Download pre-built binary
+# Download from: https://github.com/cpockrandt/genmap/releases
+wget https://github.com/cpockrandt/genmap/releases/download/genmap-v1.3.0/genmap-1.3.0-Linux-x86_64-sse4.zip
+unzip genmap-1.3.0-Linux-x86_64-sse4.zip
+chmod +x genmap-1.3.0-Linux-x86_64-sse4/bin/genmap
+sudo mv genmap-1.3.0-Linux-x86_64-sse4/bin/genmap /usr/local/bin/
 ```
 
 **macOS with Homebrew:**
@@ -149,10 +173,23 @@ brew install samtools bedtools
 # Install mosdepth
 brew install mosdepth
 
+# Install genmap (required only if using --generate-ir option)
+# Option 1: Using conda (recommended)
+conda install -c bioconda genmap
+
+# Option 2: Download pre-built binary
+# Download from: https://github.com/cpockrandt/genmap/releases
+# For Mac 64-bit optimized (requires SSE4):
+wget https://github.com/cpockrandt/genmap/releases/download/genmap-v1.3.0/genmap-1.3.0-Darwin-x86_64-sse4.zip
+unzip genmap-1.3.0-Darwin-x86_64-sse4.zip
+chmod +x genmap-1.3.0-Darwin-x86_64-sse4/bin/genmap
+sudo mv genmap-1.3.0-Darwin-x86_64-sse4/bin/genmap /usr/local/bin/
+
 # Verify installations
 samtools --version
 bedtools --version
 mosdepth --version
+genmap --help  # Verify genmap if installed
 ```
 
 **Alternative: Using Conda/Mamba (Recommended):**
@@ -169,6 +206,34 @@ mamba activate sas-pipeline
 conda install -c bioconda genmap
 # Note: Using --generate-ir will significantly slow down the entire pipeline
 ```
+
+**Installing genmap from source (optional):**
+
+If you prefer to build genmap from source:
+
+```bash
+# Clone the repository with submodules
+git clone --recursive https://github.com/cpockrandt/genmap.git
+cd genmap
+mkdir genmap-build && cd genmap-build
+
+# Build genmap (requires CMake >= 3.0, GCC >= 4.9 or Clang >= 3.8)
+cmake ../genmap -DCMAKE_BUILD_TYPE=Release
+make genmap
+
+# Install system-wide
+sudo make install
+
+# Or run directly from build directory
+./genmap --help
+```
+
+**Requirements for building genmap from source:**
+- Operating System: GNU/Linux or macOS
+- Architecture: Intel/AMD platforms that support POPCNT instruction
+- Compiler: GCC ≥ 4.9 or LLVM/Clang ≥ 3.8
+- Build system: CMake ≥ 3.0
+- Language support: C++14
 
 ### Python Dependencies
 
@@ -209,10 +274,46 @@ python -c "import pysam, pandas, numpy; print('✓ Python dependencies OK')"
 samtools --version && echo "✓ samtools OK"
 bedtools --version && echo "✓ bedtools OK"  
 mosdepth --version && echo "✓ mosdepth OK"
+genmap --help && echo "✓ genmap OK"  # Only if using --generate-ir option
 
 # Check SAS Pipeline
 python src/sas_pipeline.py --version
 ```
+
+## Performance Benchmarks
+
+### Hardware Configuration
+
+Performance benchmarks were conducted on a server with the following specifications:
+- **CPU**: Intel Xeon Gold 6526Y (2 sockets, 16 cores per socket, 2 threads per core)
+- **Total Cores**: 64 logical CPUs
+- **Architecture**: x86_64, NUMA architecture with 2 nodes
+- **Cache**: L1d 48KB, L1i 32KB, L2 2MB, L3 38.4MB per socket
+
+### Runtime Performance
+
+**Standard SAS Analysis (BE + SE):**
+- **Test Cases**: Hg002 and T2T-YAO genome assemblies
+- **Configuration**: 64 threads
+- **Runtime**: 2-4 hours
+- **Performance Characteristics**:
+  - Runtime scales proportionally with the number of errors detected in the assembly
+  - Lower-quality reference genomes with more errors require longer processing times
+  - Efficient parallel processing enables rapid analysis of high-quality assemblies
+
+**IR (Identical Region) Re-analysis:**
+- **Configuration**: 128 cores
+- **Runtime**: Approximately 4 days
+- **Purpose**: IR generation enables more precise detection by identifying false negatives that may be missed due to erroneous short-read alignments in identical regions
+- **Recommended Workflow**: First perform several rounds of standard SAS and assembly correction. Then use IR generation for fine-grained correction to catch errors initially missed in regions where short reads may be inaccurately mapped.
+
+**Note**: IR generation is computationally intensive. Users should allocate sufficient computational resources and time when enabling this option.
+
+### Accuracy and Validation
+
+SAS has been extensively validated and demonstrates high sensitivity and accuracy in detecting both base-level and structural errors in genome assemblies. The method has been rigorously tested on high-quality assemblies including Hg002 and T2T-YAO. By integrating multi-technology sequencing data (Element, HiFi, and ONT), SAS provides comprehensive error detection that leverages the complementary strengths of each platform.
+
+For detailed accuracy metrics, validation results, and comprehensive performance analysis, please refer to the preprint: [Approaching an Error-Free Diploid Human Genome Assembly of East Asian Origin](https://doi.org/10.1101/2025.08.01.667781).
 
 ## Quick Start
 
@@ -370,7 +471,7 @@ results/
 
 If you use the SAS method in your research, please cite:
 
-Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang, Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao, Yu Kang. Approaching an Error-Free Diploid Human Genome. bioRxiv. doi: https://doi.org/10.1101/2025.08.01.667781
+Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang, Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao, Yu Kang. Approaching an Error-Free Diploid Human Genome Assembly of East Asian Origin. bioRxiv. doi: https://doi.org/10.1101/2025.08.01.667781
 
 
 
