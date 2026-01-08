@@ -130,10 +130,10 @@ def filter_data(data_file, fai_file, output_file=None, exclude_mode=False, sep='
             
             # Include row based on exclude_mode
             if exclude_mode:
-                if not should_keep:  # Rows that should be excluded (满足条件的)
+                if not should_keep:  # Rows that should be excluded 
                     filtered_indices.append(idx)
             else:
-                if should_keep:  # Rows that should be kept (不满足条件的)
+                if should_keep:  # Rows that should be kept 
                     filtered_indices.append(idx)
                     
         except (ValueError, IndexError) as e:
