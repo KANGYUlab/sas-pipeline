@@ -280,6 +280,29 @@ genmap --help && echo "✓ genmap OK"  # Only if using --generate-ir option
 python src/sas_pipeline.py --version
 ```
 
+### Troubleshooting
+
+**Issue: "bad interpreter: No such file or directory" error on Linux**
+
+If you encounter the following error when running scripts on Linux:
+```
+-bash: scripts/filter_bam.sh: /bin/bash^M: bad interpreter: No such file or directory
+```
+
+This is typically caused by Windows line endings (CRLF) in shell scripts. To fix this issue, run:
+
+```bash
+# Fix all shell scripts at once
+sed -i 's/\r$//' scripts/*.sh
+chmod +x scripts/*.sh
+
+# Or fix individual scripts
+sed -i 's/\r$//' scripts/filter_bam.sh
+sed -i 's/\r$//' scripts/smallerror_short.sh
+```
+
+**Note**: This issue has been fixed in the repository. The `.gitattributes` file ensures that all shell scripts use Unix line endings (LF) going forward. If you cloned the repository and still encounter this issue, the above commands will fix it.
+
 ## Performance Benchmarks
 
 ### Hardware Configuration
