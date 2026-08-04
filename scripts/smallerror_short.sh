@@ -9,19 +9,40 @@
 
 set -euo pipefail
 
-# Function to display usage
+PROGRAM_NAME=${0##*/}
+VERSION="2.0.0"
+
 usage() {
-    echo "Usage: $0 -i INPUT_BAM -o OUTPUT_PREFIX [-t THREADS]"
-    echo ""
-    echo "Options:"
-    echo "  -i INPUT_BAM        Input BAM file path"
-    echo "  -o OUTPUT_PREFIX    Output file prefix"
-    echo "  -t THREADS          Number of threads (default: 4)"
-    echo "  -h                  Display this help message"
-    echo ""
-    echo "Example:"
-    echo "  $0 -i sample.bam -o sample_smallerror -t 8"
-    exit 1
+    cat << EOF
+Detect 50 bp windows containing low-coverage bases in a short-read BAM.
+
+Usage:
+  $PROGRAM_NAME -i INPUT_BAM -o OUTPUT_PREFIX [OPTIONS]
+
+Required arguments:
+  -i, --input INPUT_BAM     Input short-read BAM file
+  -o, --output PREFIX       Prefix for generated BED and summary files
+
+Options:
+  -t, --threads N           mosdepth threads (default: 4)
+  -h, --help                Show this help and exit
+  -v, --version             Show version and exit
+
+Example:
+  $PROGRAM_NAME -i sample.bam -o results/sample -t 8
+EOF
+}
+
+die() {
+    echo "Error: $1" >&2
+    usage >&2
+    exit 2
+}
+
+option_value_required() {
+    local option="$1"
+    local value="${2-}"
+    [[ -n "$value" ]] || die "$option requires a value"
 }
 
 # Default values
@@ -29,32 +50,44 @@ THREADS=4
 INPUT_BAM=""
 OUTPUT_PREFIX=""
 
-# Parse command line arguments
-while getopts "i:o:t:h" opt; do
-    case $opt in
-        i)
-            INPUT_BAM="$OPTARG"
+# Parse short and long options without requiring GNU getopt.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -i|--input)
+            option_value_required "$1" "${2-}"
+            INPUT_BAM="$2"
+            shift 2
             ;;
-        o)
-            OUTPUT_PREFIX="$OPTARG"
+        -o|--output)
+            option_value_required "$1" "${2-}"
+            OUTPUT_PREFIX="$2"
+            shift 2
             ;;
-        t)
-            THREADS="$OPTARG"
+        -t|--threads)
+            option_value_required "$1" "${2-}"
+            THREADS="$2"
+            shift 2
             ;;
-        h)
+        -h|--help)
             usage
+            exit 0
             ;;
-        \?)
-            echo "Invalid option: -$OPTARG" >&2
-            usage
+        -v|--version)
+            echo "$PROGRAM_NAME $VERSION"
+            exit 0
+            ;;
+        *)
+            die "unknown option or argument: $1"
             ;;
     esac
 done
 
-# Check required arguments
 if [[ -z "$INPUT_BAM" || -z "$OUTPUT_PREFIX" ]]; then
-    echo "Error: Missing required arguments"
-    usage
+    die "both --input and --output are required"
+fi
+
+if [[ ! "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    die "--threads must be a positive integer: $THREADS"
 fi
 
 # Check if input BAM file exists
@@ -106,12 +139,6 @@ echo "Step 3: Calculating per-base depth with mosdepth..."
 # We also run without -n to ensure the summary file is created for threshold calculation.
 mosdepth --threads "$THREADS" "$OUTPUT_PREFIX" "$INPUT_BAM"
 
-# Check if mosdepth completed successfully
-if [[ $? -ne 0 ]]; then
-    echo "Error: mosdepth failed"
-    exit 1
-fi
-
 # Step 4: Calculate depth threshold from mosdepth summary
 echo "Step 4: Calculating depth threshold..."
 MOSDEPTH_SUMMARY="${OUTPUT_PREFIX}.mosdepth.summary.txt"
@@ -142,7 +169,7 @@ if [[ ! -f "$PER_BASE_BED_GZ" ]]; then
     exit 1
 fi
 
-zcat "$PER_BASE_BED_GZ" | awk -v threshold="$DEPTH_THRESHOLD" 'BEGIN{OFS="\t"} $4 < threshold {print $1, $2, $3}' > "$LOW_COVERAGE_BASES_BED"
+gzip -cd -- "$PER_BASE_BED_GZ" | awk -v threshold="$DEPTH_THRESHOLD" 'BEGIN{OFS="\t"} $4 < threshold {print $1, $2, $3}' > "$LOW_COVERAGE_BASES_BED"
 
 # Step 6: Intersect low-coverage bases with 50bp windows
 echo "Step 6: Locating 50bp windows containing low-coverage bases..."

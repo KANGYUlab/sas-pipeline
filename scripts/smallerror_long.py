@@ -3,43 +3,73 @@
 Processes a BAM file based on regions defined in a BED file to analyze pileup data.
 
 This script takes a BED file specifying genomic regions, a BAM alignment file, and a
-reference FASTA file. For each region, it uses 'samtools mpileup' to generate
-pileup data, which is then processed to clean the pileup strings (removing indels
-and other special characters) and calculate statistics like average depth.
+reference FASTA file. Nearby regions are grouped into bounded 'samtools mpileup'
+queries, then split back into their original BED intervals before pileup cleaning
+and statistics are calculated.
 
 The processing is done in parallel using multiple processes to speed up the analysis.
 """
-import re
 import sys
 import argparse
 import subprocess
-import signal
 import os
 import shutil
-from multiprocessing import Pool, cpu_count
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+import tempfile
+import heapq
+from collections import OrderedDict
+from multiprocessing import Pool
 
-def process_pileup_from_file(raw_pileup_path, region_start, region_end):
+CLI_VERSION = "2.0.0"
+
+
+class CLIHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep examples and explicitly documented defaults readable."""
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def nonnegative_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return parsed
+
+def process_pileup_lines(raw_pileup_lines, region_start, region_end, verbose=False):
     """
-    Reads a raw pileup file from disk, calculates average depth, then processes it.
+    Calculate statistics from the pileup rows belonging to one BED interval.
+
     This version implements the proper cross-row alignment logic with correct processing order.
     """
     HIGH_DEPTH_THRESHOLD = 1000
 
-    # Pass 1: Calculate average depth.
+    # Parse the region once. IR analysis units are at most 50 bp, so retaining
+    # these rows in memory is bounded while avoiding a second disk read.
     total_depth = 0
     line_count = 0
     first_parts = None
-    with open(raw_pileup_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if first_parts is None and parts:
-                first_parts = parts
-            if len(parts) >= 4 and parts[3].isdigit():
-                total_depth += int(parts[3])
-            line_count += 1
-    
+    all_lines = []
+    pileup_cols = []
+    for line in raw_pileup_lines:
+        parts = line.strip().split('\t')
+        if first_parts is None and parts:
+            first_parts = parts
+        if len(parts) >= 4 and parts[3].isdigit():
+            total_depth += int(parts[3])
+        line_count += 1
+        all_lines.append(parts)
+        pileup_cols.append(list(parts[4]) if len(parts) >= 5 else [])
+
     average_depth = (total_depth / line_count) if line_count > 0 else 0.0
 
     # If depth is too high, short‑circuit and mark region as unsupported for this platform.
@@ -54,19 +84,6 @@ def process_pileup_from_file(raw_pileup_path, region_start, region_end):
         min_length = "0"
         output_parts = first_parts[:5] + [cleaned_pileup, first_parts[0], str(region_start), str(region_end), min_length, f"{average_depth:.2f}"]
         return ['\t'.join(output_parts)]
-
-    # Pass 2: Load all lines and extract pileup strings for processing
-    all_lines = []
-    pileup_cols = []
-    with open(raw_pileup_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) >= 5:
-                all_lines.append(parts)
-                pileup_cols.append(list(parts[4]))  # Convert to list for easier manipulation
-            else:
-                all_lines.append(parts)
-                pileup_cols.append([])
 
     if not pileup_cols or not all_lines:
         return []
@@ -243,7 +260,12 @@ def process_pileup_from_file(raw_pileup_path, region_start, region_end):
     valid_lengths = [len(pileup_cols[i]) for i in range(len(pileup_cols)) if i < len(all_lines) and len(all_lines[i]) >= 5]
     min_length_all = min(valid_lengths) if valid_lengths else 0
     
-    print(f"Debug: Total lines available: {len(all_lines)}, Total pileup columns: {len(pileup_cols)}", file=sys.stderr)
+    if verbose:
+        print(
+            f"Debug: Total lines available: {len(all_lines)}, "
+            f"Total pileup columns: {len(pileup_cols)}",
+            file=sys.stderr,
+        )
     
     # Only process the first line of each region
     if len(all_lines) > 0 and len(pileup_cols) > 0:
@@ -257,329 +279,662 @@ def process_pileup_from_file(raw_pileup_path, region_start, region_end):
             # Use region_start and region_end for columns 8-9 instead of parts[1] and parts[2]
             output_parts = parts[:5] + [cleaned_pileup, first_col, str(region_start), str(region_end), min_length, f"{average_depth:.2f}"]
             processed_lines.append('\t'.join(output_parts))
-            print(f"Debug: Processed first line only", file=sys.stderr)
+            if verbose:
+                print("Debug: Processed first line only", file=sys.stderr)
         else:
-            print(f"Debug: Skipping first row, len(parts)={len(parts)}, row_idx < len(pileup_cols): {row_idx < len(pileup_cols)}", file=sys.stderr)
+            if verbose:
+                print(
+                    f"Debug: Skipping first row, len(parts)={len(parts)}, "
+                    f"row_idx < len(pileup_cols): {row_idx < len(pileup_cols)}",
+                    file=sys.stderr,
+                )
     else:
-        print(f"Debug: No data to process", file=sys.stderr)
+        if verbose:
+            print("Debug: No data to process", file=sys.stderr)
             
-    print(f"Debug: Total processed lines: {len(processed_lines)}", file=sys.stderr)
+    if verbose:
+        print(f"Debug: Total processed lines: {len(processed_lines)}", file=sys.stderr)
     return processed_lines
 
-def process_region(args):
-    """
-    Worker function that streams samtools ouz
-    then processes the resulting file.
-    """
-    chrom, start, end, bam_file, ref_fasta, final_temp_file = args
-    
-    region_str = f"{chrom}:{start+1}-{end}"
-    print(f"Processing region: {region_str}", file=sys.stderr)
 
-    # Define paths for intermediate and final temp files
-    temp_dir = os.path.dirname(final_temp_file)
-    base_name = os.path.basename(final_temp_file)
-    raw_pileup_file = os.path.join(temp_dir, f"raw_{base_name}")
+def process_pileup_from_file(raw_pileup_path, region_start, region_end, verbose=False):
+    """Backward-compatible file wrapper around :func:`process_pileup_lines`."""
+    with open(raw_pileup_path, 'r') as pileup_handle:
+        return process_pileup_lines(
+            pileup_handle,
+            region_start,
+            region_end,
+            verbose=verbose,
+        )
 
+DEFAULT_BATCH_GAP = 10_000
+DEFAULT_MAX_BATCH_SPAN = 1_000_000
+DEFAULT_MAX_REGIONS_PER_BATCH = 1_000
+DEFAULT_MAX_OPEN_RAW_FILES = 64
+COPY_BUFFER_SIZE = 8 * 1024 * 1024
+MAX_MPILEUP_STDERR_BYTES = 64 * 1024
+
+
+def create_run_temp_dir(temp_parent=None):
+    """Create a private temporary directory for one pipeline invocation.
+
+    A caller-supplied path is a parent directory, never a directory owned by
+    this function.  Only the unique child returned here may be removed during
+    cleanup.  With no parent, ``tempfile`` selects the platform temp directory.
+    """
+    if temp_parent is not None:
+        os.makedirs(temp_parent, exist_ok=True)
+    return tempfile.mkdtemp(prefix="sas_pileup_", dir=temp_parent)
+
+
+def read_stderr_tail(stderr_file, max_bytes=MAX_MPILEUP_STDERR_BYTES):
+    """Return at most ``max_bytes`` from the end of a binary stderr file."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be > 0")
+
+    stderr_file.flush()
+    stderr_file.seek(0, os.SEEK_END)
+    stderr_size = stderr_file.tell()
+    stderr_file.seek(max(0, stderr_size - max_bytes), os.SEEK_SET)
+    error_output = stderr_file.read(max_bytes).decode("utf-8", errors="replace")
+    if stderr_size > max_bytes:
+        return (
+            f"[stderr truncated; showing last {max_bytes} bytes]\n"
+            f"{error_output}"
+        )
+    return error_output
+
+
+def build_region_batches(
+    regions,
+    max_gap=DEFAULT_BATCH_GAP,
+    max_span=DEFAULT_MAX_BATCH_SPAN,
+    max_regions=DEFAULT_MAX_REGIONS_PER_BATCH,
+):
+    """Group nearby regions for mpileup without changing their analysis units.
+
+    Each region is ``(chrom, start, end, input_index, reserved)``; the final
+    field is retained for compatibility with earlier helper callers.
+    A batch never crosses a chromosome, the gap between consecutive merged
+    ranges may not exceed ``max_gap``, and the complete query span may not
+    exceed ``max_span``. ``max_regions`` bounds per-worker bookkeeping.
+    """
+    if max_gap < 0:
+        raise ValueError("max_gap must be >= 0")
+    if max_span <= 0:
+        raise ValueError("max_span must be > 0")
+    if max_regions <= 0:
+        raise ValueError("max_regions must be > 0")
+
+    sorted_regions = sorted(regions, key=lambda region: (region[0], region[1], region[2], region[3]))
+    batches = []
+    current_batch = []
+    batch_chrom = None
+    batch_start = None
+    batch_end = None
+
+    for region in sorted_regions:
+        chrom, start, end = region[:3]
+        if start < 0 or end <= start:
+            raise ValueError(f"Invalid BED region: {chrom}\t{start}\t{end}")
+
+        if not current_batch:
+            should_split = False
+        else:
+            gap = max(0, start - batch_end)
+            proposed_end = max(batch_end, end)
+            should_split = (
+                chrom != batch_chrom
+                or gap > max_gap
+                or proposed_end - batch_start > max_span
+                or len(current_batch) >= max_regions
+            )
+
+        if should_split:
+            batches.append(current_batch)
+            current_batch = []
+
+        if not current_batch:
+            batch_chrom = chrom
+            batch_start = start
+            batch_end = end
+        else:
+            batch_end = max(batch_end, end)
+
+        current_batch.append(region)
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
+class BoundedAppendWriter:
+    """Append text while keeping only a bounded number of files open."""
+
+    def __init__(self, max_open_files=DEFAULT_MAX_OPEN_RAW_FILES):
+        if max_open_files <= 0:
+            raise ValueError("max_open_files must be > 0")
+        self.max_open_files = max_open_files
+        self.handles = OrderedDict()
+
+    def write(self, file_path, text):
+        handle = self.handles.pop(file_path, None)
+        if handle is None:
+            if len(self.handles) >= self.max_open_files:
+                _, oldest_handle = self.handles.popitem(last=False)
+                oldest_handle.close()
+            handle = open(file_path, 'a')
+        self.handles[file_path] = handle
+        handle.write(text)
+
+    def close(self):
+        for handle in self.handles.values():
+            handle.close()
+        self.handles.clear()
+
+
+def dispatch_pileup_lines(lines, regions, raw_paths, max_open_files=DEFAULT_MAX_OPEN_RAW_FILES):
+    """Split one coordinate-sorted mpileup stream back into original BED regions."""
+    sorted_regions = sorted(regions, key=lambda region: (region[1], region[2], region[3]))
+    next_region = 0
+    active_regions = []
+    writer = BoundedAppendWriter(max_open_files=max_open_files)
+
+    try:
+        for line in lines:
+            fields = line.split('\t', 2)
+            if len(fields) < 2:
+                continue
+
+            try:
+                chrom = fields[0]
+                position = int(fields[1]) - 1  # mpileup is 1-based; BED is 0-based.
+            except ValueError:
+                continue
+
+            active_regions = [
+                region for region in active_regions
+                if region[0] == chrom and region[2] > position
+            ]
+
+            while next_region < len(sorted_regions):
+                region = sorted_regions[next_region]
+                if region[0] != chrom or region[1] > position:
+                    break
+                next_region += 1
+                if region[2] > position:
+                    active_regions.append(region)
+
+            output_line = line if line.endswith('\n') else line + '\n'
+            for region in active_regions:
+                if region[0] == chrom and region[1] <= position < region[2]:
+                    writer.write(raw_paths[region[3]], output_line)
+    finally:
+        writer.close()
+
+
+def spool_pileup_lines(lines, regions, spool_path):
+    """Write one batch stream once and record the byte slice for each region.
+
+    A pileup position is stored only once even when BED intervals overlap.  As
+    coordinate-sorted positions belonging to an interval are contiguous in the
+    batch stream, a pair of byte offsets is sufficient to reconstruct exactly
+    the rows seen by that interval.  This replaces one raw temporary file per
+    50 bp window with one file per mpileup batch.
+    """
+    sorted_regions = sorted(regions, key=lambda region: (region[1], region[2], region[3]))
+    next_region = 0
+    active_regions = []
+    offsets = {region[3]: [None, None] for region in regions}
+
+    with open(spool_path, "wb") as spool_handle:
+        for line in lines:
+            fields = line.split('\t', 2)
+            if len(fields) < 2:
+                continue
+
+            try:
+                chrom = fields[0]
+                position = int(fields[1]) - 1
+            except ValueError:
+                continue
+
+            active_regions = [
+                region for region in active_regions
+                if region[0] == chrom and region[2] > position
+            ]
+
+            while next_region < len(sorted_regions):
+                region = sorted_regions[next_region]
+                if region[0] != chrom or region[1] > position:
+                    break
+                next_region += 1
+                if region[2] > position:
+                    active_regions.append(region)
+
+            matching_regions = [
+                region for region in active_regions
+                if region[0] == chrom and region[1] <= position < region[2]
+            ]
+            if not matching_regions:
+                continue
+
+            output_line = line if line.endswith('\n') else line + '\n'
+            encoded_line = output_line.encode("utf-8")
+            line_start = spool_handle.tell()
+            spool_handle.write(encoded_line)
+            line_end = spool_handle.tell()
+
+            for region in matching_regions:
+                region_offsets = offsets[region[3]]
+                if region_offsets[0] is None:
+                    region_offsets[0] = line_start
+                region_offsets[1] = line_end
+
+    return {
+        input_index: tuple(region_offsets)
+        for input_index, region_offsets in offsets.items()
+        if region_offsets[0] is not None
+    }
+
+
+def read_pileup_slice(spool_handle, offsets):
+    """Read and decode one region's bounded slice from a batch spool."""
+    start_offset, end_offset = offsets
+    spool_handle.seek(start_offset)
+    raw_data = spool_handle.read(end_offset - start_offset)
+    return raw_data.decode("utf-8").splitlines(keepends=True)
+
+
+def process_region_batch(args):
+    """Run one mpileup query for nearby regions, then analyze each original region."""
+    if len(args) == 4:
+        batch, bam_file, ref_fasta, batch_id = args
+        verbose = False
+        output_hint = batch[0][4]
+        temp_dir = (os.path.dirname(output_hint) if output_hint else None) or tempfile.gettempdir()
+    elif len(args) == 5:
+        batch, bam_file, ref_fasta, batch_id, verbose = args
+        output_hint = batch[0][4]
+        temp_dir = (os.path.dirname(output_hint) if output_hint else None) or tempfile.gettempdir()
+    else:
+        batch, bam_file, ref_fasta, batch_id, verbose, temp_dir = args
+    chrom = batch[0][0]
+    batch_start = min(region[1] for region in batch)
+    batch_end = max(region[2] for region in batch)
+    batch_bed_file = os.path.join(temp_dir, f"batch_{batch_id:09d}.bed")
+    raw_batch_file = os.path.join(temp_dir, f"raw_batch_{batch_id:09d}.txt")
+    result_file = os.path.join(temp_dir, f"batch_result_{batch_id:09d}.indexed")
+
+    with open(batch_bed_file, 'w') as bed_out:
+        for region in sorted(batch, key=lambda item: (item[1], item[2], item[3])):
+            bed_out.write(f"{region[0]}\t{region[1]}\t{region[2]}\n")
+
+    region_str = f"{chrom}:{batch_start + 1}-{batch_end}"
     cmd = [
         'samtools', 'mpileup', '-a', '-A', '-B', '-d', '0',
-        '-r', region_str, '-f', ref_fasta, '-Q', '0', '--ff', '0', '-x', bam_file
+        '-r', region_str, '-l', batch_bed_file,
+        '-f', ref_fasta, '-Q', '0', '--ff', '0', '-x', bam_file
     ]
-    
-    try:
-        # Step 1: Stream samtools output directly to a raw pileup file on disk.
-        with open(raw_pileup_file, 'w') as stdout_f, subprocess.Popen(cmd, stdout=stdout_f, stderr=subprocess.PIPE, universal_newlines=True) as proc:
-            _, stderr = proc.communicate() # Wait for process to finish
-            if proc.returncode != 0:
-                print(f"Samtools error for region {region_str}: {stderr}", file=sys.stderr)
-                return None
+    print(
+        f"Processing batch {batch_id}: {region_str}, {len(batch)} original regions",
+        file=sys.stderr,
+    )
 
-        # Step 2: Process the raw pileup file from disk, passing start and end coordinates.
-        formatted_output = process_pileup_from_file(raw_pileup_file, start, end)
-        
-        # Step 3: Write the final processed output.
-        if formatted_output:
-            with open(final_temp_file, 'w') as f_out:
-                f_out.write('\n'.join(formatted_output) + '\n')
-            return final_temp_file
-        
-    except Exception as e:
-        print(f"Unexpected error processing region {region_str}: {e}", file=sys.stderr)
-        return None
+    completed = False
+    try:
+        with tempfile.TemporaryFile(mode='w+b') as stderr_file:
+            with subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                universal_newlines=True,
+                bufsize=1024 * 1024,
+            ) as proc:
+                region_offsets = spool_pileup_lines(
+                    proc.stdout,
+                    batch,
+                    raw_batch_file,
+                )
+                return_code = proc.wait()
+
+            if return_code != 0:
+                error_output = read_stderr_tail(stderr_file)
+                raise RuntimeError(
+                    f"samtools mpileup failed for batch {batch_id} ({region_str}): {error_output}"
+                )
+
+        output_count = 0
+        with open(raw_batch_file, "rb") as spool_handle, open(
+            result_file, "w", encoding="utf-8"
+        ) as output_handle:
+            for _chrom_name, start, end, input_index, _unused in sorted(
+                batch, key=lambda item: item[3]
+            ):
+                offsets = region_offsets.get(input_index)
+                if offsets is None:
+                    continue
+                formatted_output = process_pileup_lines(
+                    read_pileup_slice(spool_handle, offsets),
+                    start,
+                    end,
+                    verbose=verbose,
+                )
+                for output_line in formatted_output:
+                    output_handle.write(f"{input_index}\t{output_line}\n")
+                    output_count += 1
+
+        completed = True
+        if output_count:
+            return [result_file]
+        os.remove(result_file)
+        return []
     finally:
-        # Step 4: Clean up the raw pileup file.
-        if os.path.exists(raw_pileup_file):
-            os.remove(raw_pileup_file)
-    
-    return None
+        if os.path.exists(batch_bed_file):
+            os.remove(batch_bed_file)
+        if os.path.exists(raw_batch_file):
+            os.remove(raw_batch_file)
+        if not completed and os.path.exists(result_file):
+            os.remove(result_file)
+
+
+def concatenate_files_streaming(file_list, output_file, buffer_size=COPY_BUFFER_SIZE):
+    """Concatenate files in order with fixed memory and atomic replacement."""
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    temp_output = f"{output_file}.tmp.{os.getpid()}"
+    try:
+        with open(temp_output, 'wb') as output_handle:
+            for index, file_path in enumerate(file_list, 1):
+                with open(file_path, 'rb') as input_handle:
+                    shutil.copyfileobj(input_handle, output_handle, length=buffer_size)
+                if index % 1000 == 0:
+                    print(f"  - Stream-merged {index}/{len(file_list)} files", file=sys.stderr)
+        os.replace(temp_output, output_file)
+    except Exception:
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        raise
+
+
+def _merge_indexed_file_group(input_files, output_file, strip_index=False):
+    """Merge sorted ``input_index<TAB>payload`` files with bounded memory."""
+    handles = []
+    heap = []
+    try:
+        for source_id, file_path in enumerate(input_files):
+            handle = open(file_path, "r", encoding="utf-8")
+            handles.append(handle)
+            line = handle.readline()
+            if line:
+                index_text, separator, _payload = line.partition("\t")
+                if not separator:
+                    raise ValueError(f"Malformed indexed result line in {file_path}")
+                heapq.heappush(heap, (int(index_text), source_id, line))
+
+        with open(output_file, "w", encoding="utf-8") as output_handle:
+            while heap:
+                _input_index, source_id, line = heapq.heappop(heap)
+                if strip_index:
+                    output_handle.write(line.partition("\t")[2])
+                else:
+                    output_handle.write(line)
+
+                next_line = handles[source_id].readline()
+                if next_line:
+                    index_text, separator, _payload = next_line.partition("\t")
+                    if not separator:
+                        raise ValueError(
+                            f"Malformed indexed result line in {input_files[source_id]}"
+                        )
+                    heapq.heappush(
+                        heap,
+                        (int(index_text), source_id, next_line),
+                    )
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def merge_indexed_results_streaming(
+    file_list,
+    output_file,
+    max_open_files=DEFAULT_MAX_OPEN_RAW_FILES,
+):
+    """Merge batch results by original BED order using bounded fan-in.
+
+    One result file is produced per mpileup batch instead of per BED interval.
+    Multi-pass merging keeps the number of simultaneously open files bounded.
+    """
+    if max_open_files < 2:
+        raise ValueError("max_open_files must be at least 2")
+
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    output_staging_dir = output_dir or os.getcwd()
+    merge_work_dir = (
+        os.path.dirname(file_list[0]) if file_list else output_staging_dir
+    ) or os.getcwd()
+    created_intermediates = []
+    staged_output = None
+
+    try:
+        current_files = list(file_list)
+        pass_number = 0
+        while len(current_files) > max_open_files:
+            next_files = []
+            for group_number, group_start in enumerate(
+                range(0, len(current_files), max_open_files)
+            ):
+                group = current_files[group_start:group_start + max_open_files]
+                intermediate = os.path.join(
+                    merge_work_dir,
+                    f".sas-index-merge-{os.getpid()}-{pass_number}-{group_number}.tmp",
+                )
+                _merge_indexed_file_group(group, intermediate)
+                created_intermediates.append(intermediate)
+                next_files.append(intermediate)
+            current_files = next_files
+            pass_number += 1
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=".sas-result-",
+            suffix=".tmp",
+            dir=output_staging_dir,
+            delete=False,
+        ) as staged_handle:
+            staged_output = staged_handle.name
+
+        _merge_indexed_file_group(
+            current_files,
+            staged_output,
+            strip_index=True,
+        )
+        os.replace(staged_output, output_file)
+        staged_output = None
+    finally:
+        if staged_output and os.path.exists(staged_output):
+            os.remove(staged_output)
+        for intermediate in created_intermediates:
+            if os.path.exists(intermediate):
+                os.remove(intermediate)
+
 
 def merge_files_parallel(file_list, output_file, num_threads=8, intermediate_batch_size=1000):
-    """
-    Uses a two-phase merge strategy: first merge into intermediate files, then merge to final file
-    Uses multi-threaded parallel reading to improve speed
-    """
-    if not file_list:
-        return
-    
-    total_files = len(file_list)
-    print(f"  - Starting two-phase merge: {total_files} files, using {num_threads} threads...", file=sys.stderr)
-    
-    # Phase 1: Merge small files into intermediate files
-    intermediate_dir = os.path.join(os.path.dirname(output_file), "merge_intermediate")
-    os.makedirs(intermediate_dir, exist_ok=True)
-    
-    intermediate_files = []
-    intermediate_batch_num = 0
-    
-    # Split file list into batches
-    for i in range(0, total_files, intermediate_batch_size):
-        batch_files = file_list[i:i+intermediate_batch_size]
-        intermediate_file = os.path.join(intermediate_dir, f"intermediate_{intermediate_batch_num:06d}.txt")
-        intermediate_files.append(intermediate_file)
-        
-        # Use multi-threading to read files in batch in parallel, but maintain order
-        def read_file_content(file_path):
-            try:
-                with open(file_path, 'r', buffering=1024*1024) as f:  # 1MB buffer
-                    return f.read()
-            except IOError as e:
-                print(f"Warning: Could not read file {file_path}: {e}", file=sys.stderr)
-                return None
-        
-        # Read all files in parallel, but maintain original order
-        file_contents = [None] * len(batch_files)
-        with ThreadPoolExecutor(max_workers=min(num_threads, len(batch_files))) as executor:
-            # Use dictionary to save indices, ensuring sequential writing
-            future_to_index = {executor.submit(read_file_content, f): idx 
-                              for idx, f in enumerate(batch_files)}
-            for future in as_completed(future_to_index):
-                idx = future_to_index[future]
-                content = future.result()
-                if content is not None:
-                    file_contents[idx] = content
-        
-        # Write to intermediate file (in order)
-        if any(file_contents):
-            with open(intermediate_file, 'w', buffering=1024*1024) as f_out:
-                for content in file_contents:
-                    if content is not None:
-                        f_out.write(content)
-        
-        intermediate_batch_num += 1
-        if intermediate_batch_num % 10 == 0:
-            print(f"    - Phase 1: Created {intermediate_batch_num} intermediate files...", file=sys.stderr)
-    
-    print(f"  - Phase 1 complete: Created {len(intermediate_files)} intermediate files", file=sys.stderr)
-    
-    # Phase 2: Merge intermediate files to final output
-    print(f"  - Phase 2: Merging {len(intermediate_files)} intermediate files to final output...", file=sys.stderr)
-    
-    # Try using system cat command (fastest)
+    """Backward-compatible wrapper for the fixed-memory streaming merger."""
+    del num_threads, intermediate_batch_size
+    concatenate_files_streaming(file_list, output_file)
+
+
+def process_bed_regions(
+    bed_file,
+    bam_file,
+    ref_fasta,
+    output_file,
+    temp_dir_path=None,
+    processes=64,
+    batch_gap=DEFAULT_BATCH_GAP,
+    max_batch_span=DEFAULT_MAX_BATCH_SPAN,
+    max_regions_per_batch=DEFAULT_MAX_REGIONS_PER_BATCH,
+    verbose=False,
+):
+    """Batch nearby BED regions for mpileup while preserving original outputs."""
+    if processes <= 0:
+        raise ValueError("processes must be > 0")
+
+    temp_dir = create_run_temp_dir(temp_dir_path)
+    print(f"Created temporary run directory: {temp_dir}", file=sys.stderr)
+
     try:
-        with open(output_file, 'w', buffering=1024*1024) as final_out:
-            # If number of intermediate files is small, can directly use cat
-            if len(intermediate_files) <= 1000:
-                cat_cmd = ['cat'] + intermediate_files
-                result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                      universal_newlines=True, bufsize=1024*1024)
-                if result.returncode == 0:
-                    final_out.write(result.stdout)
-                    print(f"  - Phase 2 complete: Used system cat command", file=sys.stderr)
-                else:
-                    raise subprocess.CalledProcessError(result.returncode, cat_cmd)
-            else:
-                # If too many intermediate files, use cat in batches
-                final_batch_size = 500
-                for i in range(0, len(intermediate_files), final_batch_size):
-                    batch = intermediate_files[i:i+final_batch_size]
-                    cat_cmd = ['cat'] + batch
-                    result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                          universal_newlines=True, bufsize=1024*1024)
-                    if result.returncode == 0:
-                        final_out.write(result.stdout)
-                    else:
-                        raise subprocess.CalledProcessError(result.returncode, cat_cmd)
-                    if (i // final_batch_size + 1) % 10 == 0:
-                        print(f"    - Processed {i + len(batch)}/{len(intermediate_files)} intermediate files...", file=sys.stderr)
-                print(f"  - Phase 2 complete: Used batched system cat", file=sys.stderr)
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-        # Fallback to Python multi-threaded merge (maintaining order)
-        print(f"  - System cat failed ({e}), using Python multi-threaded merge (maintaining order)...", file=sys.stderr)
-        
-        def merge_intermediate_file(intermediate_file):
-            try:
-                with open(intermediate_file, 'r', buffering=1024*1024) as f_in:
-                    return f_in.read()
-            except IOError as e:
-                print(f"Warning: Could not read intermediate file {intermediate_file}: {e}", file=sys.stderr)
-                return None
-        
-        # Read in parallel but maintain order
-        file_contents = [None] * len(intermediate_files)
-        with ThreadPoolExecutor(max_workers=num_threads) as executor:
-            future_to_index = {executor.submit(merge_intermediate_file, f): idx 
-                              for idx, f in enumerate(intermediate_files)}
-            for future in as_completed(future_to_index):
-                idx = future_to_index[future]
-                content = future.result()
-                if content is not None:
-                    file_contents[idx] = content
-        
-        # Write to final file in order
-        with open(output_file, 'w', buffering=1024*1024) as final_out:
-            for content in file_contents:
-                if content is not None:
-                    final_out.write(content)
-        
-        print(f"  - Phase 2 complete: Used Python multi-threaded merge", file=sys.stderr)
-    
-    # Clean up intermediate file directory
-    shutil.rmtree(intermediate_dir)
-    print(f"  - Cleanup of intermediate file directory complete", file=sys.stderr)
-
-def process_bed_regions(bed_file, bam_file, ref_fasta, output_file, temp_dir_path=None, processes=64):
-    """
-    Reads a BED file in chunks and processes them in parallel.
-    This version includes zero-padding for temp files to ensure correct final order.
-    """
-    
-    # Use specified temp directory or default
-    if temp_dir_path:
-        temp_dir = temp_dir_path
-    else:
-        temp_dir = "temp_pileup_results"
-    
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir)
-    print(f"Created temporary directory: {temp_dir}", file=sys.stderr)
-
-    all_successful_files = []
-    region_counter = 0
-
-    with open(bed_file, 'r') as bed_f, Pool(processes=processes) as pool:
-        print(f"Processing BED file in chunks of {processes} regions using {processes} parallel processes...", file=sys.stderr)
-        
-        while True:
-            chunk_lines = [line for _, line in zip(range(processes), bed_f)]
-            if not chunk_lines:
-                break
-
-            chunk_args = []
-            for line in chunk_lines:
+        regions = []
+        with open(bed_file, 'r') as bed_handle:
+            for line_number, line in enumerate(bed_handle, 1):
                 parts = line.strip().split('\t')
-                if len(parts) >= 3:
-                    try:
-                        chrom, start, end = parts[0], int(parts[1]), int(parts[2])
-                        # Zero-pad filenames to ensure correct alphabetical sorting later
-                        temp_output_file = os.path.join(temp_dir, f"region_{region_counter:09d}.txt")
-                        chunk_args.append((chrom, start, end, bam_file, ref_fasta, temp_output_file))
-                        region_counter += 1
-                    except (ValueError, IndexError):
-                        print(f"Warning: Skipping malformed BED line: {line.strip()}", file=sys.stderr)
+                if len(parts) < 3:
+                    if line.strip() and not line.startswith('#'):
+                        print(f"Warning: Skipping malformed BED line {line_number}: {line.strip()}", file=sys.stderr)
+                    continue
+                try:
+                    chrom, start, end = parts[0], int(parts[1]), int(parts[2])
+                    input_index = len(regions)
+                    # The fifth tuple field is retained for compatibility with
+                    # helper callers. Results are now spooled per batch rather
+                    # than allocating one path and one file per interval.
+                    regions.append((chrom, start, end, input_index, None))
+                except ValueError:
+                    print(f"Warning: Skipping malformed BED line {line_number}: {line.strip()}", file=sys.stderr)
 
-            if chunk_args:
-                print(f"  - Submitting a new chunk of {len(chunk_args)} regions for processing.", file=sys.stderr)
-                for result_file in pool.imap_unordered(process_region, chunk_args):
-                    if result_file:
-                        all_successful_files.append(result_file)
+        batches = build_region_batches(
+            regions,
+            max_gap=batch_gap,
+            max_span=max_batch_span,
+            max_regions=max_regions_per_batch,
+        )
+        print(
+            f"Grouped {len(regions)} original regions into {len(batches)} mpileup batches "
+            f"(gap <= {batch_gap:,} bp, span <= {max_batch_span:,} bp, "
+            f"regions/batch <= {max_regions_per_batch})",
+            file=sys.stderr,
+        )
 
-    print(f"All chunks processed. Merging {len(all_successful_files)} result files into {output_file}...", file=sys.stderr)
-    # Sort the list of successful files before merging to maintain order.
-    all_successful_files.sort()
-    
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(output_file)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
-    
-    # Use optimized two-phase merge strategy
-    # Decide which strategy to use based on number of files
-    num_files = len(all_successful_files)
-    
-    if num_files <= 1000:
-        # Fewer files, use original single-phase merge (faster)
-        try:
-            with open(output_file, 'w', buffering=1024*1024) as final_out:
-                cat_cmd = ['cat'] + all_successful_files
-                result = subprocess.run(cat_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                      universal_newlines=True, bufsize=1024*1024)
-                if result.returncode == 0:
-                    final_out.write(result.stdout)
-                    print(f"  - Fast merge complete: Used system cat command", file=sys.stderr)
-                else:
-                    raise subprocess.CalledProcessError(result.returncode, cat_cmd)
-        except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
-            # Fallback to Python merge
-            print(f"  - Cat command failed ({e}), using Python merge...", file=sys.stderr)
-            with open(output_file, 'w', buffering=1024*1024) as final_out:
-                for i, temp_file in enumerate(all_successful_files):
-                    if i % 1000 == 0 and i > 0:
-                        print(f"    - Merged {i}/{num_files} files...", file=sys.stderr)
-                    try:
-                        with open(temp_file, 'r', buffering=512*1024) as temp_in:
-                            shutil.copyfileobj(temp_in, final_out, 1024*1024)
-                    except IOError as e:
-                        print(f"Warning: Could not read temp file {temp_file}: {e}", file=sys.stderr)
-    else:
-        # More files, use two-phase merge + multi-threading
-        # Calculate appropriate intermediate batch size and thread count
-        # Intermediate batch size: each intermediate file contains approximately 1000 small files
-        intermediate_batch_size = 1000
-        # Thread count: use half of process count, but no more than 16
-        num_threads = min(max(processes // 2, 4), 16)
-        
-        merge_files_parallel(all_successful_files, output_file, 
-                           num_threads=num_threads, 
-                           intermediate_batch_size=intermediate_batch_size)
+        all_successful_files = []
+        if batches:
+            worker_count = min(processes, len(batches))
+            batch_args = [
+                (batch, bam_file, ref_fasta, batch_id, verbose, temp_dir)
+                for batch_id, batch in enumerate(batches)
+            ]
+            with Pool(processes=worker_count) as pool:
+                for result_files in pool.imap_unordered(process_region_batch, batch_args):
+                    all_successful_files.extend(result_files)
 
-    print(f"Cleaning up temporary directory: {temp_dir}", file=sys.stderr)
-    shutil.rmtree(temp_dir)
+        all_successful_files.sort()
+        print(
+            f"All batches processed. Order-merging {len(all_successful_files)} batch result files "
+            f"into {output_file}...",
+            file=sys.stderr,
+        )
+        merge_indexed_results_streaming(all_successful_files, output_file)
+    finally:
+        print(f"Cleaning up temporary directory: {temp_dir}", file=sys.stderr)
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def main():
     """Main function to parse arguments and run the processing."""
     parser = argparse.ArgumentParser(
-        description="Analyze samtools mpileup output for regions in a BED file, processing in parallel chunks.",
-        formatter_class=argparse.RawTextHelpFormatter,
+        description=(
+            "Analyze long-read pileup evidence for BED regions using bounded, "
+            "parallel samtools mpileup batches."
+        ),
+        formatter_class=CLIHelpFormatter,
         epilog="""
-Example:
+Examples:
   python3 %(prog)s target.bed input.bam ref.fasta output.txt
-  python3 %(prog)s target.bed input.bam ref.fasta output.txt --temp-dir /path/to/temp
-  python3 %(prog)s target.bed input.bam ref.fasta output.txt --processes 16
-"""
+  python3 %(prog)s target.bed input.bam ref.fasta output.txt -p 16 -t /scratch
+  python3 %(prog)s target.bed input.bam ref.fasta output.txt -g 10000 -S 1000000
+""",
     )
-    parser.add_argument("bed_file", help="Path to the input BED file defining regions of interest.")
-    parser.add_argument("bam_file", help="Path to the input BAM file.")
-    parser.add_argument("ref_fasta", help="Path to the reference genome FASTA file.")
-    parser.add_argument("output_file", help="Path to the output file to store results.")
-    parser.add_argument(
-        "--temp-dir", "-t",
-        type=str,
+
+    inputs = parser.add_argument_group("required inputs")
+    inputs.add_argument("bed_file", metavar="BED", help="Candidate-region BED file")
+    inputs.add_argument("bam_file", metavar="BAM", help="Input long-read BAM file")
+    inputs.add_argument(
+        "ref_fasta", metavar="FASTA", help="Reference genome FASTA file"
+    )
+    inputs.add_argument("output_file", metavar="OUTPUT", help="Output result file")
+
+    runtime = parser.add_argument_group("runtime options")
+    runtime.add_argument(
+        "-t", "--temp-dir",
         default=None,
-        help="Path to the temporary directory for intermediate files. If not specified, uses 'temp_pileup_results' in current directory."
+        metavar="DIR",
+        help=(
+            "Parent directory for a unique temporary run directory. "
+            "The parent and its existing contents are preserved. "
+            "The platform temporary directory is used when omitted"
+        )
+    )
+    runtime.add_argument(
+        "-p", "--processes",
+        type=positive_int,
+        default=64,
+        metavar="N",
+        help="Number of parallel worker processes (default: 64)"
+    )
+
+    batching = parser.add_argument_group("mpileup batching options")
+    batching.add_argument(
+        "-g", "--batch-gap",
+        type=nonnegative_int,
+        default=DEFAULT_BATCH_GAP,
+        metavar="BP",
+        help=f"Maximum gap between regions placed in one batch (default: {DEFAULT_BATCH_GAP} bp)"
+    )
+    batching.add_argument(
+        "-S", "--max-batch-span",
+        type=positive_int,
+        default=DEFAULT_MAX_BATCH_SPAN,
+        metavar="BP",
+        help=f"Maximum genomic span covered by one batch (default: {DEFAULT_MAX_BATCH_SPAN} bp)"
+    )
+    batching.add_argument(
+        "-n", "--max-regions-per-batch",
+        type=positive_int,
+        default=DEFAULT_MAX_REGIONS_PER_BATCH,
+        metavar="N",
+        help=f"Maximum original BED regions in one batch (default: {DEFAULT_MAX_REGIONS_PER_BATCH})"
+    )
+    runtime.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print per-region pileup-cleaning diagnostics"
     )
     parser.add_argument(
-        "--processes", "-p",
-        type=int,
-        default=64,
-        help="Number of parallel processes to use for processing regions (default: 64)."
+        "--version", action="version", version=f"%(prog)s {CLI_VERSION}"
     )
     
     args = parser.parse_args()
     
-    print(f"Starting analysis with a chunk-based parallel model ({args.processes} regions at a time)...")
+    print(f"Starting analysis with a batch-based parallel model ({args.processes} workers)...")
     process_bed_regions(
         args.bed_file,
         args.bam_file,
         args.ref_fasta,
         args.output_file,
         args.temp_dir,
-        args.processes
+        args.processes,
+        args.batch_gap,
+        args.max_batch_span,
+        args.max_regions_per_batch,
+        args.verbose,
     )
     print(f"Analysis complete. Results saved to {args.output_file}")
 
 if __name__ == '__main__':
     main()
-
-
-

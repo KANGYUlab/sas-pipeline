@@ -4,11 +4,37 @@
 # Optimized for different sequencing technologies
 set -euo pipefail
 
+PROGRAM_NAME=${0##*/}
+VERSION="2.0.0"
+
+# Detect a portable default without assuming GNU coreutils is installed.
+detect_default_threads() {
+    local detected=""
+
+    if command -v getconf >/dev/null 2>&1; then
+        detected=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+        if [[ "$detected" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%s\n' "$detected"
+            return
+        fi
+    fi
+
+    if command -v sysctl >/dev/null 2>&1; then
+        detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+        if [[ "$detected" =~ ^[1-9][0-9]*$ ]]; then
+            printf '%s\n' "$detected"
+            return
+        fi
+    fi
+
+    printf '1\n'
+}
+
 # Default parameters
 MODE=""
 MAX_SPLITS_BASE=3.0
 MAX_SPLITS_KB=0.05
-THREADS=$(nproc)
+THREADS=$(detect_default_threads)
 INPUT_BAM=""
 OUTPUT_BAM=""
 QUIET=false
@@ -17,44 +43,44 @@ PRIMARY_ONLY=true  # Only used in long-read mode
 # Function to show usage
 usage() {
     cat << EOF
-BAM Filter Tool - High-performance BAM filtering
+Filter BAM alignments for SAS analysis.
 
-Usage: $0 <mode> -i input.bam -o output.bam [options]
+Usage:
+  $PROGRAM_NAME MODE -i INPUT_BAM -o OUTPUT_BAM [OPTIONS]
 
-MODES:
-    short-read      Filter for perfect matches with no clipping (NM=0, no S/H in CIGAR)
-                    Optimized for short-read sequencing (Illumina, Element, etc.)
-    
-    long-read       Filter reads based on split alignment count (SA tag)
-                    Optimized for long-read sequencing (ONT, PacBio, etc.)
-                    Default: primary alignment only processing for optimal performance
+Modes:
+  short-read              Keep perfect matches (NM=0) without S/H clipping
+  long-read               Filter by SA split count; primary alignments only by default
 
-COMMON OPTIONS:
-    -i, --input FILE       Input BAM file (required)
-    -o, --output FILE      Output BAM file (required)
-    -t, --threads N        Number of threads (default: $(nproc))
-    -q, --quiet           Suppress output
-    -h, --help            Show this help
+Required arguments:
+  -i, --input INPUT_BAM   Input BAM file
+  -o, --output OUTPUT_BAM Filtered BAM output file
 
-LONG-READ MODE OPTIONS:
-    --max-splits-base N    Base maximum splits (default: 3.0)
-    --max-splits-kb N      Splits per kb factor (default: 0.05)
-    --include-all-reads    Include secondary/supplementary alignments (default: primary-only)
+General options:
+  -t, --threads N         samtools threads (default: $THREADS)
+  -q, --quiet             Suppress progress and summary messages
+  -h, --help              Show this help and exit
+  -v, --version           Show version and exit
 
-EXAMPLES:
-    # Short-read filtering (perfect matches, no clips)
-    $0 short-read -i illumina.bam -o perfect_matches.bam -t 64
+Long-read options:
+      --max-splits-base N Base split threshold (default: $MAX_SPLITS_BASE)
+      --max-splits-kb N   Additional splits allowed per kb (default: $MAX_SPLITS_KB)
+      --include-all-reads Include secondary and supplementary alignments
 
-    # Long-read filtering (default: primary-only for ONT/PacBio)
-    $0 long-read -i nanopore.bam -o filtered.bam -t 64
-
-    # Long-read filtering including all alignments
-    $0 long-read -i pacbio.bam -o filtered.bam -t 64 --include-all-reads
-
-Note: 
-- Short-read mode processes all reads for comprehensive filtering
-- Long-read mode defaults to primary-only processing for optimal performance
+Examples:
+  $PROGRAM_NAME short-read -i illumina.bam -o perfect.bam -t 16
+  $PROGRAM_NAME long-read -i ont.bam -o filtered.bam --max-splits-base 3
 EOF
+}
+
+option_value_required() {
+    local option="$1"
+    local value="${2-}"
+    if [[ -z "$value" ]]; then
+        echo "Error: $option requires a value" >&2
+        usage >&2
+        exit 2
+    fi
 }
 
 # Short-read filtering function (perfect matches, no clipping)
@@ -68,8 +94,8 @@ filter_short_read_mode() {
     [[ "$quiet" == false ]] && echo "Filtering criteria: NM=0 (perfect matches) + no soft/hard clipping"
     [[ "$quiet" == false ]] && echo "Processing all reads (primary, secondary, and supplementary)"
     
-    # Build samtools flags (no primary-only filtering for short reads)
-    local flags="-h -@ $threads -e '[NM]==0'"
+    # Build samtools arguments (no primary-only filtering for short reads)
+    local samtools_args=(view -h -@ "$threads" -e '[NM]==0')
     
     # Count input reads for statistics
     local total_reads=0
@@ -82,6 +108,7 @@ filter_short_read_mode() {
     [[ "$quiet" == false ]] && echo "Applying filters: NM=0 and no soft/hard clipping..."
     
     # Create output directory if it doesn't exist
+    local output_dir
     output_dir=$(dirname "$output_bam")
     if [[ ! -d "$output_dir" ]]; then
         echo "Creating output directory: $output_dir"
@@ -89,7 +116,7 @@ filter_short_read_mode() {
     fi
     
     # Ultra-fast short-read filtering pipeline
-    if ! eval "samtools view $flags \"$input_bam\"" | \
+    if ! samtools "${samtools_args[@]}" "$input_bam" | \
          awk 'BEGIN{OFS="\t"} /^@/ {print; next} $6 !~ /[SH]/ {print}' | \
          samtools view -b -@ "$threads" -o "$output_bam" -; then
         echo "Error: Short-read filtering pipeline failed" >&2
@@ -108,8 +135,10 @@ filter_short_read_mode() {
         echo "Calculating statistics..."
 
         # Count reads from output to get kept reads
-        local kept_reads=$(samtools view -c -@ "$threads" "$output_bam")
-        local filtered_reads=$((total_reads - kept_reads))
+        local kept_reads
+        kept_reads=$(samtools view -c -@ "$threads" "$output_bam")
+        local filtered_reads
+        filtered_reads=$((total_reads - kept_reads))
 
         # Perform detailed analysis for filtered reads (this requires extra passes)
         # 1. Count reads with NM > 0, and among them, count those that are also clipped.
@@ -125,7 +154,8 @@ filter_short_read_mode() {
         clip_only_nm_ok_count=$(samtools view -@ "$threads" -e '[NM]==0' "$input_bam" | awk 'BEGIN{count=0} $6~/[SH]/{count++} END{print count}')
         
         # 3. Calculate reads filtered ONLY due to NM > 0 (and not clipping).
-        local nm_only_count=$((nm_gt_0_count - both_nm_and_clip_count))
+        local nm_only_count
+        nm_only_count=$((nm_gt_0_count - both_nm_and_clip_count))
         
         local percentage="0.0"
         if (( total_reads > 0 )); then
@@ -157,10 +187,10 @@ filter_long_read_mode() {
     [[ "$quiet" == false ]] && echo "Split threshold = $max_splits_base + $max_splits_kb * (read_length_kb)"
     
     # Build samtools view command with optional primary-only filter
-    local samtools_flags="-h -@ $threads"
+    local samtools_args=(view -h -@ "$threads")
     if [[ "$primary_only" == true ]]; then
         # -F 0x904 excludes: unmapped(4) + secondary(256) + supplementary(2048)
-        samtools_flags="$samtools_flags -F 0x904"
+        samtools_args+=(-F 0x904)
         [[ "$quiet" == false ]] && echo "Filtering to primary alignments only (FLAG & 0x904 == 0)"
     else
         [[ "$quiet" == false ]] && echo "Processing all alignments (primary, secondary, and supplementary)"
@@ -180,7 +210,8 @@ filter_long_read_mode() {
     fi
     
     # Create AWK script for filtering
-    local awk_script=$(cat << 'EOF'
+    local awk_script
+    awk_script=$(cat << 'EOF'
 BEGIN {
     max_splits_base = ENVIRON["MAX_SPLITS_BASE"]
     max_splits_kb = ENVIRON["MAX_SPLITS_KB"]
@@ -239,6 +270,7 @@ EOF
     [[ "$quiet" == false ]] && echo "Filtering reads based on split alignment count..."
     
     # Create output directory if it doesn't exist
+    local output_dir
     output_dir=$(dirname "$output_bam")
     if [[ ! -d "$output_dir" ]]; then
         echo "Creating output directory: $output_dir"
@@ -246,7 +278,7 @@ EOF
     fi
     
     # Use a more efficient pipeline with proper error handling
-    if ! samtools view $samtools_flags "$input_bam" | \
+    if ! samtools "${samtools_args[@]}" "$input_bam" | \
          awk "$awk_script" | \
          samtools view -b -@ "$threads" -o "$output_bam" -; then
         echo "Error: Long-read filtering pipeline failed" >&2
@@ -263,9 +295,15 @@ EOF
     # Calculate statistics
     if [[ "$quiet" == false ]]; then
         echo "Calculating statistics..."
-        local kept_reads=$(samtools view -c -@ "$threads" "$output_bam")
-        local filtered_reads=$((total_reads - kept_reads))
-        local percentage=$(awk "BEGIN {printf \"%.1f\", $kept_reads/$total_reads*100}")
+        local kept_reads
+        kept_reads=$(samtools view -c -@ "$threads" "$output_bam")
+        local filtered_reads
+        filtered_reads=$((total_reads - kept_reads))
+
+        local percentage="0.0"
+        if (( total_reads > 0 )); then
+            percentage=$(awk "BEGIN {printf \"%.1f\", $kept_reads/$total_reads*100}")
+        fi
         
         echo "Results:"
         if [[ "$primary_only" == true ]]; then
@@ -283,8 +321,19 @@ EOF
 if [[ $# -lt 1 ]]; then
     echo "Error: Mode is required" >&2
     usage >&2
-    exit 1
+    exit 2
 fi
+
+case "$1" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    -v|--version)
+        echo "$PROGRAM_NAME $VERSION"
+        exit 0
+        ;;
+esac
 
 # Get mode
 MODE="$1"
@@ -294,25 +343,29 @@ shift
 if [[ "$MODE" != "short-read" && "$MODE" != "long-read" ]]; then
     echo "Error: Invalid mode '$MODE'. Must be 'short-read' or 'long-read'" >&2
     usage >&2
-    exit 1
+    exit 2
 fi
 
 # Parse remaining arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         -i|--input)
+            option_value_required "$1" "${2-}"
             INPUT_BAM="$2"
             shift 2
             ;;
         -o|--output)
+            option_value_required "$1" "${2-}"
             OUTPUT_BAM="$2"
             shift 2
             ;;
         -t|--threads)
+            option_value_required "$1" "${2-}"
             THREADS="$2"
             shift 2
             ;;
         --max-splits-base)
+            option_value_required "$1" "${2-}"
             if [[ "$MODE" != "long-read" ]]; then
                 echo "Warning: --max-splits-base is only used in long-read mode" >&2
             fi
@@ -320,6 +373,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --max-splits-kb)
+            option_value_required "$1" "${2-}"
             if [[ "$MODE" != "long-read" ]]; then
                 echo "Warning: --max-splits-kb is only used in long-read mode" >&2
             fi
@@ -342,10 +396,14 @@ while [[ $# -gt 0 ]]; do
             usage
             exit 0
             ;;
+        -v|--version)
+            echo "$PROGRAM_NAME $VERSION"
+            exit 0
+            ;;
         *)
             echo "Unknown option: $1" >&2
             usage >&2
-            exit 1
+            exit 2
             ;;
     esac
 done
@@ -354,6 +412,22 @@ done
 if [[ -z "$INPUT_BAM" || -z "$OUTPUT_BAM" ]]; then
     echo "Error: Input and output BAM files are required" >&2
     usage >&2
+    exit 2
+fi
+
+if [[ ! "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: Threads must be a positive integer: $THREADS" >&2
+    exit 1
+fi
+
+numeric_pattern='^([0-9]+([.][0-9]*)?|[.][0-9]+)$'
+if [[ ! "$MAX_SPLITS_BASE" =~ $numeric_pattern ]]; then
+    echo "Error: --max-splits-base must be a non-negative number: $MAX_SPLITS_BASE" >&2
+    exit 1
+fi
+
+if [[ ! "$MAX_SPLITS_KB" =~ $numeric_pattern ]]; then
+    echo "Error: --max-splits-kb must be a non-negative number: $MAX_SPLITS_KB" >&2
     exit 1
 fi
 
@@ -392,4 +466,4 @@ case "$MODE" in
         ;;
 esac
 
-[[ "$QUIET" == false ]] && echo "All operations completed successfully!" 
+[[ "$QUIET" == false ]] && echo "All operations completed successfully!"

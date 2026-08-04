@@ -6,13 +6,32 @@ Handle terminal chromosome regions, merge regions, and output BED files
 """
 
 import argparse
-import pysam
 import sys
 import os
 import subprocess
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+
+try:
+    import pysam
+except ModuleNotFoundError:
+    pysam = None
+
+CLI_VERSION = "2.0.0"
+
+
+class CLIHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep examples and explicitly documented defaults readable."""
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
 
 
 def read_fasta_index(fai_file):
@@ -34,105 +53,98 @@ def read_fasta_index(fai_file):
 
 def generate_sliding_windows(chromosomes, window_size=30000, step_size=2000):
     """Generate sliding windows, ensuring the last window covers the chromosome end, with start divisible by step_size (2k) and length 28k-30k (can be <30k), and start is as close as possible to the end."""
+    if window_size <= 0 or step_size <= 0:
+        raise ValueError("window_size and step_size must be positive")
+
     windows = []
     for chrom, length in chromosomes.items():
+        if length <= 0:
+            continue
+
+        chrom_windows = []
+
+        # A short contig still needs one valid window.  Keeping this case local
+        # to the chromosome also prevents the previous chromosome's last
+        # window from suppressing it.
+        if length < 28000:
+            windows.append((chrom, 0, length))
+            continue
+
         # Generate normal sliding windows
         for start in range(0, length - window_size + 1, step_size):
             end = start + window_size
-            windows.append((chrom, start, end))
+            chrom_windows.append((chrom, start, end))
 
         # Ensure the last window covers the chromosome end
         min_last_window_length = 28000
         max_last_window_length = 30000
         # Find the largest step_size-multiple start <= length-min_last_window_length
         last_possible_start = ((length - min_last_window_length) // step_size) * step_size
-        # Find the closest start to the end that gives length in [28k, 30k]
+        # The largest aligned start gives the terminal window closest to the
+        # chromosome end.  With the default 2 kb step its length is 28-30 kb.
         last_window = None
-        for potential_start in range(last_possible_start, length, step_size):
-            window_length = length - potential_start
+        if last_possible_start >= 0:
+            window_length = length - last_possible_start
             if min_last_window_length <= window_length <= max_last_window_length:
-                last_window = (chrom, potential_start, length)
+                last_window = (chrom, last_possible_start, length)
         # Add the last window if needed and not duplicate
-        if last_window:
-            if not windows or windows[-1][2] < length or windows[-1][1] != last_window[1]:
-                windows.append(last_window)
-        elif not windows or windows[-1][2] < length:
+        if last_window and last_window not in chrom_windows:
+            chrom_windows.append(last_window)
+        elif not last_window and not any(end == length for _, _, end in chrom_windows):
             # fallback: just add from last_possible_start
-            fallback_start = last_possible_start
-            if fallback_start < 0:
-                fallback_start = 0
-            windows.append((chrom, fallback_start, length))
+            fallback_start = max(0, last_possible_start)
+            chrom_windows.append((chrom, fallback_start, length))
+
+        windows.extend(chrom_windows)
     return windows
 
 
-def has_spanning_reads(bam_file, chrom, start, end):
-    """Check if the specified window has spanning reads"""
-    try:
-        # Spanning read definition: read spans the entire window region
-        for read in bam_file.fetch(chrom, start, end):
-            # Skip unmapped reads
+def find_non_spanning_windows(bam_file, chrom, chrom_windows):
+    """Find non-spanning windows with one coordinate-ordered BAM scan.
+
+    For a window ``[start, end)``, a spanning read must satisfy exactly the
+    original predicate ``read_start <= start and read_end >= end``.  While
+    window starts increase, the maximum end among all reads whose starts have
+    already been seen is sufficient to evaluate that predicate.
+    """
+    ordered_windows = sorted(chrom_windows, key=lambda window: (window[1], window[2]))
+    no_spanning_windows = []
+    read_iterator = iter(bam_file.fetch(chrom))
+
+    def next_mapped_interval():
+        for read in read_iterator:
             if read.is_unmapped:
                 continue
-                
             read_start = read.reference_start
             read_end = read.reference_end
-            
-            # Check if it's a spanning read: read start <= window start and read end >= window end
             if read_start is not None and read_end is not None:
-                if read_start <= start and read_end >= end:
-                    return True  # Found one spanning read is sufficient
-        
-        return False
-        
-    except Exception as e:
-        print(f"Error checking spanning reads for {chrom}:{start}-{end}: {e}", file=sys.stderr)
-        return False
+                return read_start, read_end
+        return None
 
+    next_read = next_mapped_interval()
+    maximum_read_end = -1
+    for window_chrom, start, end in ordered_windows:
+        if window_chrom != chrom:
+            raise ValueError(f"Window chromosome {window_chrom} does not match {chrom}")
 
-def process_window_batch(args):
-    """Process a batch of windows - for multiprocessing"""
-    bam_file_path, window_batch, batch_id = args
-    
-    # Open BAM file in subprocess
-    try:
-        bam_file = pysam.AlignmentFile(bam_file_path, "rb")
-    except Exception as e:
-        print(f"Error opening BAM file in process {batch_id}: {e}", file=sys.stderr)
-        return []
-    
-    no_spanning_windows = []
-    
-    for chrom, start, end in window_batch:
-        if not has_spanning_reads(bam_file, chrom, start, end):
+        while next_read is not None and next_read[0] <= start:
+            maximum_read_end = max(maximum_read_end, next_read[1])
+            next_read = next_mapped_interval()
+
+        if maximum_read_end < end:
             no_spanning_windows.append((chrom, start, end))
-    
-    bam_file.close()
+
     return no_spanning_windows
 
 
-def split_windows_into_batches(windows, num_processes):
-    """Split windows into batches, avoiding over-segmentation"""
-    total_windows = len(windows)
-    min_batch_size = 50  # Minimum batch size
-    
-    # If too few windows, reduce process count
-    if total_windows < min_batch_size:
-        # Too few windows, use single batch
-        return [windows]
-    
-    # Calculate reasonable batch size
-    # Ensure each batch has at least min_batch_size windows
-    max_effective_processes = max(1, total_windows // min_batch_size)
-    effective_processes = min(num_processes, max_effective_processes)
-    
-    batch_size = max(min_batch_size, total_windows // effective_processes)
-    
-    batches = []
-    for i in range(0, total_windows, batch_size):
-        batch = windows[i:i + batch_size]
-        batches.append(batch)
-    
-    return batches
+def process_chromosome(args):
+    """Open one BAM handle and scan one chromosome in a worker process."""
+    bam_file_path, chrom, chrom_windows = args
+    bam_file = pysam.AlignmentFile(bam_file_path, "rb")
+    try:
+        return find_non_spanning_windows(bam_file, chrom, chrom_windows)
+    finally:
+        bam_file.close()
 
 
 def process_terminal_regions(spanning_regions, chromosomes):
@@ -247,17 +259,43 @@ def assign_corrected_regions_to_2k_windows(corrected_regions, window_size=2000):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze spanning reads in BAM files')
-    parser.add_argument('bam_file', help='BAM file path')
-    parser.add_argument('fai_file', help='FASTA index file path (.fai)')
-    parser.add_argument('-w', '--window-size', type=int, default=30000, 
-                       help='Window size (default: 30000)')
-    parser.add_argument('-s', '--step-size', type=int, default=2000, 
-                       help='Step size (default: 2000)')
-    parser.add_argument('-o', '--output', required=True, help='Output prefix')
-    parser.add_argument('-p', '--processes', type=int, default=multiprocessing.cpu_count(),
-                       help=f'Number of parallel processes (default: {multiprocessing.cpu_count()})')
+    parser = argparse.ArgumentParser(
+        description="Find BAM windows without reads spanning the complete interval.",
+        formatter_class=CLIHelpFormatter,
+        epilog="""
+Examples:
+  python3 %(prog)s input.bam reference.fa.fai -o sample
+  python3 %(prog)s input.bam reference.fa.fai -o sample -w 30000 -s 2000 -p 8
+        """,
+    )
+    inputs = parser.add_argument_group("required inputs")
+    inputs.add_argument("bam_file", metavar="BAM", help="Input BAM file")
+    inputs.add_argument("fai_file", metavar="FAI", help="Reference FASTA index")
+    inputs.add_argument(
+        "-o", "--output", required=True, metavar="PREFIX",
+        help="Prefix for generated BED files",
+    )
+
+    analysis = parser.add_argument_group("analysis options")
+    analysis.add_argument(
+        "-w", "--window-size", type=positive_int, default=30000, metavar="BP",
+        help="Sliding-window size (default: 30000 bp)",
+    )
+    analysis.add_argument(
+        "-s", "--step-size", type=positive_int, default=2000, metavar="BP",
+        help="Distance between consecutive window starts (default: 2000 bp)",
+    )
+    analysis.add_argument(
+        "-p", "--processes", type=positive_int,
+        default=multiprocessing.cpu_count(), metavar="N",
+        help=f"Number of chromosome worker processes (default: {multiprocessing.cpu_count()})",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {CLI_VERSION}"
+    )
     args = parser.parse_args()
+    if pysam is None:
+        parser.error("missing required Python dependency: pysam")
     print(f"Reading fasta index from {args.fai_file}...", file=sys.stderr)
     chromosomes = read_fasta_index(args.fai_file)
     print(f"Found {len(chromosomes)} chromosomes", file=sys.stderr)
@@ -271,30 +309,42 @@ def main():
     except Exception as e:
         print(f"Error accessing BAM file {args.bam_file}: {e}", file=sys.stderr)
         sys.exit(1)
-    print(f"Splitting windows into batches for {args.processes} processes...", file=sys.stderr)
-    window_batches = split_windows_into_batches(windows, args.processes)
-    actual_processes = len(window_batches)
-    print(f"Created {actual_processes} batches (optimized from {args.processes} processes)", file=sys.stderr)
-    if actual_processes < args.processes:
-        avg_windows_per_batch = len(windows) // actual_processes if actual_processes > 0 else 0
-        print(f"Optimized: Using {actual_processes} processes with ~{avg_windows_per_batch} windows per batch", file=sys.stderr)
+    windows_by_chromosome = {}
+    for window in windows:
+        windows_by_chromosome.setdefault(window[0], []).append(window)
+    chromosome_args = [
+        (args.bam_file, chrom, chrom_windows)
+        for chrom, chrom_windows in windows_by_chromosome.items()
+    ]
+    actual_processes = min(max(1, args.processes), len(chromosome_args)) if chromosome_args else 0
+    print(
+        f"Scanning {len(chromosome_args)} chromosomes with {actual_processes} processes...",
+        file=sys.stderr,
+    )
     total_windows = len(windows)
     no_spanning_windows = []
     print(f"Analyzing {total_windows} windows with {actual_processes} processes...", file=sys.stderr)
-    batch_args = [(args.bam_file, batch, i) for i, batch in enumerate(window_batches)]
-    with ProcessPoolExecutor(max_workers=actual_processes) as executor:
-        future_to_batch = {executor.submit(process_window_batch, batch_arg): i 
-                          for i, batch_arg in enumerate(batch_args)}
-        completed_batches = 0
-        for future in as_completed(future_to_batch):
-            batch_id = future_to_batch[future]
-            try:
-                batch_result = future.result()
-                no_spanning_windows.extend(batch_result)
-                completed_batches += 1
-                print(f"Completed batch {completed_batches}/{len(window_batches)}", file=sys.stderr)
-            except Exception as e:
-                print(f"Batch {batch_id} generated an exception: {e}", file=sys.stderr)
+    if len(chromosome_args) == 1:
+        no_spanning_windows.extend(process_chromosome(chromosome_args[0]))
+    elif chromosome_args:
+        with ProcessPoolExecutor(max_workers=actual_processes) as executor:
+            future_to_chrom = {
+                executor.submit(process_chromosome, chromosome_arg): chromosome_arg[1]
+                for chromosome_arg in chromosome_args
+            }
+            completed_chromosomes = 0
+            for future in as_completed(future_to_chrom):
+                chrom = future_to_chrom[future]
+                try:
+                    no_spanning_windows.extend(future.result())
+                    completed_chromosomes += 1
+                    print(
+                        f"Completed chromosome {completed_chromosomes}/{len(chromosome_args)}",
+                        file=sys.stderr,
+                    )
+                except Exception as e:
+                    print(f"Chromosome {chrom} generated an exception: {e}", file=sys.stderr)
+                    raise
     no_spanning_windows.sort(key=lambda x: (x[0], x[1]))
     print("Merging non-spanning windows...", file=sys.stderr)
     # After collecting all no_spanning_windows, write them to a temp BED file
@@ -307,36 +357,27 @@ def main():
             f.write(f"{chrom}\t{start}\t{end}\n")
     print(f"Current working directory: {os.getcwd()}", file=sys.stderr)
     print(f"Temp BED file: {os.path.abspath(temp_bed_file)}", file=sys.stderr)
-    # Check if temp BED file exists and is non-empty
-    if not os.path.exists(temp_bed_file) or os.path.getsize(temp_bed_file) == 0:
-        print(f"Error: {temp_bed_file} does not exist or is empty! No non-spanning windows found.", file=sys.stderr)
-        sys.exit(1)
-    print(f"Temp BED file exists and is non-empty.", file=sys.stderr)
-    # Sort the temp BED file before merging
-    sorted_bed_file = temp_bed_file + ".sorted"
-    print(f"About to sort: {os.path.abspath(temp_bed_file)} -> {os.path.abspath(sorted_bed_file)}", file=sys.stderr)
-    try:
-        subprocess.run(f"sort -k1,1 -k2,2n {temp_bed_file} > {sorted_bed_file}", shell=True, check=True)
-        print(f"Sorted BED file created: {sorted_bed_file}", file=sys.stderr)
-        print(f"Sorted BED file absolute path: {os.path.abspath(sorted_bed_file)}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error sorting BED file: {e}", file=sys.stderr)
-        os.remove(temp_bed_file)
-        sys.exit(1)
     # Use bedtools merge to merge all non-spanning windows
     merged_bed_file = f"{args.output}.non_spanning_regions.merged.bed"
-    print(f"About to merge: {os.path.abspath(sorted_bed_file)} -> {os.path.abspath(merged_bed_file)}", file=sys.stderr)
-    cmd = ["bedtools", "merge", "-i", sorted_bed_file]
-    try:
-        with open(merged_bed_file, 'w') as outbed:
-            subprocess.run(cmd, stdout=outbed, check=True)
-        print(f"bedtools merge completed: {merged_bed_file}", file=sys.stderr)
-        print(f"Merged BED file absolute path: {os.path.abspath(merged_bed_file)}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error running bedtools merge: {e}", file=sys.stderr)
-        os.remove(temp_bed_file)
-        os.remove(sorted_bed_file)
-        sys.exit(1)
+    if no_spanning_windows:
+        # no_spanning_windows was already sorted in Python, so bedtools can
+        # consume it directly without another shell sort process.
+        print(f"About to merge: {os.path.abspath(temp_bed_file)} -> {os.path.abspath(merged_bed_file)}", file=sys.stderr)
+        cmd = ["bedtools", "merge", "-i", temp_bed_file]
+        try:
+            with open(merged_bed_file, 'w') as outbed:
+                subprocess.run(cmd, stdout=outbed, check=True)
+            print(f"bedtools merge completed: {merged_bed_file}", file=sys.stderr)
+            print(f"Merged BED file absolute path: {os.path.abspath(merged_bed_file)}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error running bedtools merge: {e}", file=sys.stderr)
+            os.remove(temp_bed_file)
+            sys.exit(1)
+    else:
+        # All windows have spanning reads.  This is a valid result and both
+        # public BED outputs must still be created as empty files.
+        open(merged_bed_file, 'w').close()
+        print("No non-spanning windows found; creating empty output files.", file=sys.stderr)
     # Read merged regions for terminal correction
     merged_regions = []
     with open(merged_bed_file, 'r') as f:
@@ -346,7 +387,6 @@ def main():
                 chrom, start, end = fields[0], int(fields[1]), int(fields[2])
                 merged_regions.append((chrom, start, end))
     os.remove(temp_bed_file)
-    os.remove(sorted_bed_file)
     if not merged_regions:
         print(f"Warning: No merged non-spanning regions found!", file=sys.stderr)
     # Apply terminal correction

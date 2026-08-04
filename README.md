@@ -1,502 +1,557 @@
 # SAS: an alignment-based metric for assembly errors
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](src/_version.py)
+[![CI](https://github.com/KANGYUlab/sas-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/KANGYUlab/sas-pipeline/actions/workflows/ci.yml)
 
-## Overview
+SAS (Sufficient Alignment Support) evaluates genome assemblies by identifying
+regions that lack sufficient support from mapped short reads, PacBio HiFi reads,
+or Oxford Nanopore (ONT) reads. It reports base-level errors (BE), structural
+errors (SE), genome-wide quality values, and per-chromosome summaries.
 
-SAS (Sufficient Alignment Support) is a comprehensive toolkit for systematically evaluating genome assembly quality using multi-technology data integration. Unlike traditional methods that identify inconsistencies between assembly and aligned reads, SAS detects assembly errors by flagging erroneous windows without sufficient support from mapped reads. It combines short-read (Illumina), HiFi (PacBio), and ONT (Oxford Nanopore) sequencing data to identify and classify both Base-level Errors (BE) and Structural Errors (SE) with high sensitivity and accuracy.
+The default BE + SE workflow is optimized for fast whole-genome analysis. It
+uses candidate-driven pileups, batched external-tool calls, parallel workers,
+streaming I/O, and a single ordered spanning-read scan per chromosome instead
+of repeatedly scanning the same alignments.
 
-The SAS algorithm employs a dual-approach strategy with technology-specific optimizations:
-- **BE (Base-level Errors)**: Detected in 50bp windows using high-precision reads from all platforms
-- **SE (Structural Errors)**: Identified in 2kb windows using ultra-long ONT reads
-- 
+## Contents
 
-### Detailed Detection Methodology
+- [How SAS works](#how-sas-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Command-line parameters](#command-line-parameters)
+- [Helper programs](#helper-programs)
+- [Performance and implementation notes](#performance-and-implementation-notes)
+- [Output files](#output-files)
+- [Testing](#testing)
+- [Citation](#citation)
 
-#### 1. **BE (Base-level Errors) Detection**
+## How SAS works
 
-**Window Strategy**: 
-- **Window Size**: 50bp sliding windows across diploid assembly
-- **Support Threshold**: >10% of overall mean sequencing depth from any platform
-- **Data Sources**: High-precision reads from Illumina, HiFi, and ONT platforms
+![SAS principle: structural-error and base-error detection windows](docs/images/sas-principle.jpg)
 
-**Adaptive Thresholds for Special Regions**:
-The support threshold is relaxed to >10% of local depth in challenging regions where high-accuracy platforms show bias:
+**Figure 1. SAS detection principle.** Structural errors (SE) are evaluated in
+2 kb windows using ultra-long ONT alignment depth, indels, clipping, and
+spanning-read support. Base-level errors (BE) are evaluated in 50 bp windows
+using perfectly aligned short reads and supporting HiFi or ultra-long ONT
+evidence.
 
-1. **Telomeric Regions**: Within 10kb of chromosomal ends
-2. **Degenerative Repeats**: GnA or CnT repeats where GA/CT% ≥90% and GC% ≥60%
-3. **High GC Content**: Regions with GC% ≥90%
+### Base-level errors (BE)
 
-*Rationale*: In these regions, Element and HiFi platforms show strong bias, requiring reliance on ONT reads for support validation.
+BE analysis begins with 50 bp candidate windows. Low-coverage short-read
+windows are evaluated with HiFi and ONT pileup evidence. A window is retained
+when the available technologies do not provide sufficient alignment support.
 
-#### 2. **SE (Structural Errors) Detection**  
+The standard support threshold is based on 10% of mean sequencing depth.
+Terminal regions, compositionally biased repeats, and extreme-GC regions use
+the project-specific adaptive rules implemented in `filter_be.py`.
 
-**Window Strategy**:
-- **Window Size**: 2kb sliding windows across the genome
-- **Data Source**: Ultra-long ONT reads exclusively  
-- **Analysis Approach**: Multi-signal integration with position-aware criteria
+### Structural errors (SE)
 
-**Multi-Signal Detection Framework**:
+SE analysis evaluates 2 kb windows using filtered ONT alignments and combines:
 
-**Core Detection Modules**:
-- **INDEL Events**: Large insertions/deletions (≥50bp) identified through CIGAR analysis
-- **Clipping Analysis**: Soft/hard clipping events indicating potential misjoins (excluding chromosome termini)
-- **Depth Anomalies**: Coverage deviations (<20% or >200% of mean) indicating collapses/duplications
-- **Integration Logic**: Rule-based combination of signals with different criteria for chromosome ends vs. internal regions
+- large insertions and deletions (default minimum: 50 bp);
+- soft/hard clipping evidence;
+- low- and high-depth anomalies;
+- windows without a read spanning the complete spanning interval.
 
-**Position-Aware Analysis**:
-- **Internal Regions**: Apply both depth-based and event-based criteria ( >50% of window reads)
-- **Terminal Regions** (±10kb from chromosome ends): Relaxed criteria accounting for telomeric complexity, focus on event-based detection
+Internal windows and chromosome-terminal windows use different decision rules.
+By default, the terminal region size is 10 kb. Spanning analysis uses 30 kb
+windows at a 2 kb step and applies terminal correction before reporting merged
+non-spanning intervals.
 
-**Key Features**:
-- Multi-window allocation for spanning events
-- False positive mitigation at chromosome termini  
-- Context-specific thresholds for different genomic regions
+### Identical-region (IR) re-analysis
 
-##### Non-spanning Reads Detection
+`--generate-ir` uses `genmap` to generate identical-region BED intervals from
+parental haplotypes. SAS first searches for maternal/paternal FASTA files and can
+otherwise split a diploid reference using recognized chromosome suffixes. The
+generated `IR.bed` is re-analysed with HiFi and ONT evidence.
+If `-a/--additional-bed-file` is supplied at the same time, SAS keeps both
+sources and evaluates the union of low-coverage, user-provided, and generated
+IR candidates; one source no longer replaces another.
 
-- For each 2kb step window, check whether any ONT read fully spans a 30kb window starting at that position (the last window always covers the chromosome end, with length 28-30kb). If no spanning read is found, the region is considered non-spanning.
+For re-analysis, every IR interval is expanded into reference-aligned windows
+of at most 50 bp. These windows are combined with the ordinary BE candidates,
+sorted in reference order, and deduplicated by exact coordinates. Adjacent
+windows are **not** merged: each 50 bp row remains an independent algorithmic
+unit through HiFi/ONT pileup cleaning and evidence merging.
 
-- **Terminal correction:** After merging, if a region starts at the chromosome beginning, the last 28kb is removed; if a region ends at the chromosome end, the first 28kb is removed. This ensures only valid internal non-spanning regions are reported and avoids false positives at chromosome boundaries.
+IR refinement is optional and does not affect the speed of the default workflow.
+When enabled, it adds a `genmap` indexing/mapping phase and re-evaluates extra BE
+candidates. Its additional runtime varies with assembly size, candidate count,
+storage speed, and available CPU resources, so SAS does not assign a fixed
+runtime estimate.
 
-- **BED file:** All merged and terminal-corrected non-spanning regions are output as `se.non_spanning_regions.merged.bed` (0-based, BED format).
+### Quality value
 
+SAS reports a Phred-scaled assembly quality value:
 
-### Quality Value Calculation
-
-The final assembly quality is quantified using the Phred-scaled Quality Value:
-
+```text
+QV_SAS = -10 × log10((BE_windows + SE_windows) / assembly_length)
 ```
-QV_SAS = -10 × log₁₀((SE_windows + BE_windows) / Assembly_Length)
-```
 
-**Where**:
-- **SE_windows**: Number of 2kb windows flagged as structural errors
-- **BE_windows**: Number of 50bp windows flagged as base-level errors  
-- **Assembly_Length**: Total length of the reference assembly (in bases)
+When no error windows are detected, QV is reported as infinity.
 
-### IR (Identical Regions) re-analyze
+## Requirements
 
-IR (Identical Regions) are regions where short reads may be inaccurate mapped due to identical sequence.
+### Input data
 
-The `--generate-ir` option automatically generates an IR bed file using genmap on parental haplotypes and re-analyzed using HiFi and ONT data to improve accuracy . This process:
+- one coordinate-sorted short-read BAM;
+- one coordinate-sorted PacBio HiFi BAM;
+- one coordinate-sorted ONT BAM;
+- the assembly/reference FASTA.
 
-1. **Automatically detects or extracts parental haplotypes**: 
-   - First searches for separate mat and pat FASTA files in the reference directory
-   - If not found, automatically extracts haplotypes from the diploid reference genome by detecting chromosome suffix patterns (e.g., `_MATERNAL`/`_PATERNAL`, `_hap1`/`_hap2`, etc.)
-   - The two most common suffix patterns are automatically identified and used to split the diploid genome into two haplotypes
-2. **Runs genmap on each haplotype**:
-   - `genmap index` to build the index
-   - `genmap map -K 150 -E 0` to map k-mers
-3. **Processes results**: Uses awk to filter and extend regions, then merges with bedtools
-4. **Merges both haplotypes**: Combines mat and pat IR regions into a single IR.bed file
+When `--skip-filter` is used, the supplied BAM files must already satisfy the
+pipeline's filtering expectations and have usable BAM indexes.
 
-**Important Notes:**
-- **WARNING: Using --generate-ir will significantly slow down the ENTIRE pipeline.** 
-  - The subsequent BE analysis will be slower as it needs to process additional IR regions
-- The generated IR.bed is automatically used as the additional bed file for BE analysis
+### Software
 
+SAS is intended for Linux and other POSIX environments with GNU Bash. Windows
+users should run it under WSL2 or a Linux container; native Windows command
+shells are not supported by the Bash helper programs.
+
+- Python 3.8 or newer;
+- `samtools`;
+- `bedtools`;
+- `mosdepth`;
+- `genmap` only when using `--generate-ir`.
+
+Core Python dependencies are listed in [requirements.txt](requirements.txt).
+Before a run begins, SAS reports all missing command-line dependencies required
+by the selected BE/SE/IR mode in one error message.
 
 ## Installation
 
-**Required External Tools:**
-- `samtools` (v1.10+)
-- `bedtools` (v2.25+)
-- `mosdepth` (v0.3.0+, for SE analysis)
-- `genmap` (required only if using `--generate-ir` option for IR generation)
-
-### System Dependencies
-
-**Ubuntu/Debian:**
-```bash
-# Update package lists
-sudo apt-get update
-
-# Install basic tools
-sudo apt-get install -y samtools bedtools
-
-# Install mosdepth (for SE analysis)
-wget https://github.com/brentp/mosdepth/releases/download/v0.3.3/mosdepth
-chmod +x mosdepth
-sudo mv mosdepth /usr/local/bin/
-
-# Install genmap (required only if using --generate-ir option)
-# Option 1: Using conda (recommended)
-conda install -c bioconda genmap
-
-# Option 2: Download pre-built binary
-# Download from: https://github.com/cpockrandt/genmap/releases
-# For Linux 64-bit optimized (requires SSE4):
-wget https://github.com/cpockrandt/genmap/releases/download/genmap-v1.3.0/genmap-1.3.0-Linux-x86_64-sse4.zip
-unzip genmap-1.3.0-Linux-x86_64-sse4.zip
-chmod +x genmap-1.3.0-Linux-x86_64-sse4/bin/genmap
-sudo mv genmap-1.3.0-Linux-x86_64-sse4/bin/genmap /usr/local/bin/
-
-# Verify installations
-samtools --version
-bedtools --version
-mosdepth --version
-genmap --help  # Verify genmap if installed
-```
-
-**CentOS/RHEL/Rocky Linux:**
-```bash
-# Install EPEL repository
-sudo yum install -y epel-release
-
-# Install basic tools
-sudo yum install -y samtools bedtools
-
-# Install mosdepth manually
-wget https://github.com/brentp/mosdepth/releases/download/v0.3.3/mosdepth
-chmod +x mosdepth
-sudo mv mosdepth /usr/local/bin/
-
-# Install genmap (required only if using --generate-ir option)
-# Option 1: Using conda (recommended)
-conda install -c bioconda genmap
-
-# Option 2: Download pre-built binary
-# Download from: https://github.com/cpockrandt/genmap/releases
-wget https://github.com/cpockrandt/genmap/releases/download/genmap-v1.3.0/genmap-1.3.0-Linux-x86_64-sse4.zip
-unzip genmap-1.3.0-Linux-x86_64-sse4.zip
-chmod +x genmap-1.3.0-Linux-x86_64-sse4/bin/genmap
-sudo mv genmap-1.3.0-Linux-x86_64-sse4/bin/genmap /usr/local/bin/
-```
-
-**macOS with Homebrew:**
-```bash
-# Install basic tools
-brew install samtools bedtools
-
-# Install mosdepth
-brew install mosdepth
-
-# Install genmap (required only if using --generate-ir option)
-# Option 1: Using conda (recommended)
-conda install -c bioconda genmap
-
-# Option 2: Download pre-built binary
-# Download from: https://github.com/cpockrandt/genmap/releases
-# For Mac 64-bit optimized (requires SSE4):
-wget https://github.com/cpockrandt/genmap/releases/download/genmap-v1.3.0/genmap-1.3.0-Darwin-x86_64-sse4.zip
-unzip genmap-1.3.0-Darwin-x86_64-sse4.zip
-chmod +x genmap-1.3.0-Darwin-x86_64-sse4/bin/genmap
-sudo mv genmap-1.3.0-Darwin-x86_64-sse4/bin/genmap /usr/local/bin/
-
-# Verify installations
-samtools --version
-bedtools --version
-mosdepth --version
-genmap --help  # Verify genmap if installed
-```
-
-**Alternative: Using Conda/Mamba (Recommended):**
-```bash
-# Create a new environment with all dependencies
-conda create -n sas-pipeline python=3.8 samtools bedtools mosdepth -c bioconda
-conda activate sas-pipeline
-
-# Or if using mamba (faster)
-mamba create -n sas-pipeline python=3.8 samtools bedtools mosdepth -c bioconda
-mamba activate sas-pipeline
-
-# If you plan to use --generate-ir option, also install genmap:
-conda install -c bioconda genmap
-# Note: Using --generate-ir will significantly slow down the entire pipeline
-```
-
-**Installing genmap from source (optional):**
-
-If you prefer to build genmap from source:
+### Recommended: Conda/Mamba plus local package install
 
 ```bash
-# Clone the repository with submodules
-git clone --recursive https://github.com/cpockrandt/genmap.git
-cd genmap
-mkdir genmap-build && cd genmap-build
-
-# Build genmap (requires CMake >= 3.0, GCC >= 4.9 or Clang >= 3.8)
-cmake ../genmap -DCMAKE_BUILD_TYPE=Release
-make genmap
-
-# Install system-wide
-sudo make install
-
-# Or run directly from build directory
-./genmap --help
-```
-
-**Requirements for building genmap from source:**
-- Operating System: GNU/Linux or macOS
-- Architecture: Intel/AMD platforms that support POPCNT instruction
-- Compiler: GCC ≥ 4.9 or LLVM/Clang ≥ 3.8
-- Build system: CMake ≥ 3.0
-- Language support: C++14
-
-### Python Dependencies
-
-**Basic installation:**
-```bash
-# Install core dependencies
-pip install -r requirements.txt
-
-# Or install specific packages
-pip install "numpy>=1.16.0" "pandas>=1.0.0" "pysam>=0.15.0"
-```
-
-
-### SAS Pipeline Installation
-
-```bash
-# Clone the repository
 git clone https://github.com/KANGYUlab/sas-pipeline.git
 cd sas-pipeline
 
-# Make scripts executable
-chmod +x scripts/*.sh
+conda create -n sas-pipeline -c conda-forge -c bioconda \
+  python=3.11 samtools bedtools mosdepth
+conda activate sas-pipeline
 
-# Test installation
+python -m pip install .
+```
+
+Install `genmap` only when IR generation is required:
+
+```bash
+conda install -c conda-forge -c bioconda genmap
+```
+
+The package installs two console commands:
+
+```text
+sas-pipeline       complete BE + SE workflow
+sas-se-analysis    standalone structural-error workflow
+```
+
+### Run directly from a clone
+
+```bash
+python -m pip install -r requirements.txt
 python src/sas_pipeline.py --help
-
-
 ```
 
-### Verification
+Shell helpers are launched explicitly with Bash by the pipeline, so executable
+permission is not required for packaged installations.
 
-Test your installation with a simple command:
-```bash
-# Check Python dependencies
-python -c "import pysam, pandas, numpy; print('✓ Python dependencies OK')"
-
-# Check external tools
-samtools --version && echo "✓ samtools OK"
-bedtools --version && echo "✓ bedtools OK"  
-mosdepth --version && echo "✓ mosdepth OK"
-genmap --help && echo "✓ genmap OK"  # Only if using --generate-ir option
-
-# Check SAS Pipeline
-python src/sas_pipeline.py --version
-```
-
-### Troubleshooting
-
-**Issue: "bad interpreter: No such file or directory" error on Linux**
-
-If you encounter the following error when running scripts on Linux:
-```
--bash: scripts/filter_bam.sh: /bin/bash^M: bad interpreter: No such file or directory
-```
-
-This is typically caused by Windows line endings (CRLF) in shell scripts. To fix this issue, run:
+### Optional dependencies
 
 ```bash
-# Fix all shell scripts at once
-sed -i 's/\r$//' scripts/*.sh
-chmod +x scripts/*.sh
-
-# Or fix individual scripts
-sed -i 's/\r$//' scripts/filter_bam.sh
-sed -i 's/\r$//' scripts/smallerror_short.sh
+python -m pip install ".[viz]"   # plotting packages
+python -m pip install ".[dev]"   # test and development packages
 ```
 
-**Note**: This issue has been fixed in the repository. The `.gitattributes` file ensures that all shell scripts use Unix line endings (LF) going forward. If you cloned the repository and still encounter this issue, the above commands will fix it.
-
-## Performance Benchmarks
-
-### Hardware Configuration
-
-Performance benchmarks were conducted on a server with the following specifications:
-- **CPU**: Intel Xeon Gold 6526Y (2 sockets, 16 cores per socket, 2 threads per core)
-- **Total Cores**: 64 logical CPUs
-- **Architecture**: x86_64, NUMA architecture with 2 nodes
-- **Cache**: L1d 48KB, L1i 32KB, L2 2MB, L3 38.4MB per socket
-
-### Runtime Performance
-
-**Standard SAS Analysis (BE + SE):**
-- **Test Cases**: Hg002 and T2T-YAO genome assemblies
-- **Configuration**: 64 threads
-- **Runtime**: 2-4 hours
-- **Performance Characteristics**:
-  - Runtime scales proportionally with the number of errors detected in the assembly
-  - Lower-quality reference genomes with more errors require longer processing times
-  - Efficient parallel processing enables rapid analysis of high-quality assemblies
-
-**IR (Identical Region) Re-analysis:**
-- **Configuration**: 128 cores
-- **Runtime**: Approximately 4 days
-- **Purpose**: IR generation enables more precise detection by identifying false negatives that may be missed due to erroneous short-read alignments in identical regions
-- **Recommended Workflow**: First perform several rounds of standard SAS and assembly correction. Then use IR generation for fine-grained correction to catch errors initially missed in regions where short reads may be inaccurately mapped.
-
-**Note**: IR generation is computationally intensive. Users should allocate sufficient computational resources and time when enabling this option.
-
-### Accuracy and Validation
-
-SAS has been extensively validated and demonstrates high sensitivity and accuracy in detecting both base-level and structural errors in genome assemblies. The method has been rigorously tested on high-quality assemblies including Hg002 and T2T-YAO. By integrating multi-technology sequencing data (Element, HiFi, and ONT), SAS provides comprehensive error detection that leverages the complementary strengths of each platform.
-
-For detailed accuracy metrics, validation results, and comprehensive performance analysis, please refer to the preprint: [Approaching an Error-Free Diploid Human Genome Assembly of East Asian Origin](https://doi.org/10.1101/2025.08.01.667781).
-
-## Quick Start
-
-### Basic Usage
+### Verify the installation
 
 ```bash
-# Run complete pipeline (BE + SE analysis)
-python src/sas_pipeline.py \
+samtools --version
+bedtools --version
+mosdepth --version
+sas-pipeline --version
+sas-se-analysis --version
+```
+
+All SAS commands should report version `2.0.0`.
+
+## Quick start
+
+### Complete BE + SE analysis
+
+```bash
+sas-pipeline \
+  -i illumina.bam \
+  -H hifi.bam \
+  -N ont.bam \
+  -r reference.fa \
+  -o results \
+  -t 32
+```
+
+The equivalent long-form invocation remains supported:
+
+```bash
+sas-pipeline \
   --short-read-bam illumina.bam \
   --hifi-bam hifi.bam \
   --ont-bam ont.bam \
   --reference-fa reference.fa \
   --output-dir results \
-  --threads 64
-```
-
-### Advanced Usage
-
-```bash
-# Run only BE (base-level errors) analysis
-python src/sas_pipeline.py \
-  --short-read-bam illumina.bam \
-  --hifi-bam hifi.bam \
-  --ont-bam ont.bam \
-  --reference-fa reference.fa \
-  --output-dir results \
-  --no-se-analysis \
-  --threads 32
-
-# Run only SE (structural errors) analysis with pre-filtered BAM
-python src/sas_pipeline.py \
-  --short-read-bam illumina.bam \
-  --hifi-bam hifi.bam \
-  --ont-bam ont_filtered.bam \
-  --reference-fa reference.fa \
-  --output-dir results \
-  --no-be-analysis \
-  --skip-filter \
-  --threads 32
-
-# Custom analysis with specific parameters
-python src/sas_pipeline.py \
-  --short-read-bam illumina.bam \
-  --hifi-bam hifi.bam \
-  --ont-bam ont.bam \
-  --reference-fa reference.fa \
-  --output-dir results \
-  --threads 64 \
-  --se-window-size 2000 \
-  --se-min-indel-length 50
-
-  # Run with automatic IR (Identical Region) generation
-  # WARNING: This will significantly slow down the ENTIRE pipeline (several hours for IR generation + slower BE analysis)
-  # The pipeline will automatically detect mat and pat FASTA files, or extract haplotypes from the diploid reference genome
-python src/sas_pipeline.py \
-  --short-read-bam illumina.bam \
-  --hifi-bam hifi.bam \
-  --ont-bam ont.bam \
-  --reference-fa reference.fa \
-  --output-dir results \
-  --generate-ir \
   --threads 32
 ```
 
-## Parameters Reference
+### BE analysis only
 
-### Required Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `--short-read-bam` | string | **Required.** Path to short-read BAM file (Illumina, Element, etc.). |
-| `--hifi-bam` | string | **Required.** Path to HiFi BAM file (PacBio HiFi).  |
-| `--ont-bam` | string | **Required.** Path to ONT BAM file (Oxford Nanopore).  |
-| `--reference-fa` | string | **Required.** Path to reference genome FASTA file. Will be indexed automatically if `.fai` not provided. |
-| `--output-dir` | string | **Required.** Output directory for all results. Will be created if it doesn't exist. |
-
-### Optional Parameters
-
-#### Basic Configuration
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--reference-fai` | string | auto-generated | Path to reference genome FASTA index file (.fai). If not provided, will be generated automatically from `--reference-fa`. |
-| `--threads` | integer | 8 | Number of threads to use for parallel processing. Recommended: 32-128. |
-| `--scripts-dir` | string | `{pipeline_base}/scripts` | Path to scripts directory containing analysis tools. |
-| `--src-dir` | string | `{pipeline_base}/src` | Path to source directory containing pipeline modules. |
-
-#### Pipeline Control
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--skip-filter` | flag | False | Skip BAM filtering step if input BAM files are already filtered. Use when BAMs are pre-processed. |
-| `--no-be-analysis` | flag | False | Skip base error (BE) analysis completely. Only runs SE analysis. |
-| `--no-se-analysis` | flag | False | Skip structural error (SE) analysis completely. Only runs BE analysis. |
-
-#### SE Analysis Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--se-window-size` | integer | 2000 | Window size for SE analysis in base pairs. Standard is 2kb windows. |
-| `--se-min-indel-length` | integer | 50 | Minimum INDEL length for SE analysis in base pairs. Events smaller than this are ignored. |
-
-#### Bed Masking Options
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--bed-files` | string(s) | None | Paths to bed files for masking (e.g., `chr1.bed chr2.bed`). Multiple files are allowed. Regions in these files will be excluded from analysis. |
-
-#### IR (Identical Region) Generation Options
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `--generate-ir` | flag | False | **Automatically generate IR (Identical Region) bed file** using genmap on parental haplotypes. This option will automatically detect mat and pat FASTA files from the reference directory, or if not found, extract haplotypes from the diploid reference genome by detecting chromosome suffix patterns (e.g., `_MATERNAL`/`_PATERNAL`, `_hap1`/`_hap2`). **WARNING: Using this option will significantly slow down the ENTIRE pipeline.** IR generation itself is computationally intensive (may take several hours), and the subsequent BE analysis will also be slower as it needs to process additional IR regions. IR regions are used to re-analyze regions where read mapping may be inaccurate using HiFi and ONT data. When enabled, the generated IR.bed will be automatically used as the additional bed file for BE analysis. |
-| `--additional-bed-file` | string | None | Path to an additional bed file that will be split into 50bp windows and merged with low-coverage regions for BE analysis. If `--generate-ir` is enabled, this option is ignored (IR.bed will be used instead). |
-
-#### Information
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `--version` | flag | Display version information and exit. |
-| `--help` | flag | Display help information and exit. |
-
-
-
-
-## Output Structure
-
+```bash
+sas-pipeline -i illumina.bam -H hifi.bam -N ont.bam \
+  -r reference.fa -o results --no-se-analysis
 ```
+
+### SE analysis only with pre-filtered BAMs
+
+```bash
+sas-pipeline -i illumina.filtered.bam -H hifi.filtered.bam -N ont.filtered.bam \
+  -r reference.fa -o results --skip-filter --no-be-analysis
+```
+
+### Add candidate or masking BED files
+
+```bash
+# Add BED regions to BE candidate generation.
+sas-pipeline -i illumina.bam -H hifi.bam -N ont.bam \
+  -r reference.fa -o results -a candidate_regions.bed
+
+# Exclude intervals from final BE/SE results.
+sas-pipeline -i illumina.bam -H hifi.bam -N ont.bam \
+  -r reference.fa -o results -b centromeres.bed gaps.bed
+```
+
+### Generate identical regions
+
+```bash
+sas-pipeline -i illumina.bam -H hifi.bam -N ont.bam \
+  -r reference.fa -o results --generate-ir
+```
+
+## Command-line parameters
+
+Run `sas-pipeline -h` to print the same reference from the installed version.
+
+### Required inputs
+
+| Short | Long | Value | Description |
+|---|---|---|---|
+| `-i` | `--short-read-bam` | `BAM` | Short-read BAM file. |
+| `-H` | `--hifi-bam` | `BAM` | PacBio HiFi BAM file. |
+| `-N` | `--ont-bam` | `BAM` | Oxford Nanopore BAM file. |
+| `-r` | `--reference-fa` | `FASTA` | Assembly/reference FASTA. |
+| `-o` | `--output-dir` | `DIR` | Output root containing `final/`, `work/`, `logs/`, and `metadata/`. |
+
+### General options
+
+| Short | Long | Value/default | Description |
+|---|---|---|---|
+| `-f` | `--reference-fai` | `FAI` / auto | Existing FASTA index; generated when omitted. |
+| `-t` | `--threads` | `N` / `8` | Threads available to `samtools` and `mosdepth`. |
+|  | `--pileup-workers` | `N` / `min(threads, 16)` | Concurrent HiFi/ONT mpileup batches; lower this if memory or storage is saturated. |
+|  | `--se-workers` | `N` / `min(threads, 8)` | Concurrent SE chromosome/spanning workers. |
+|  | `--scripts-dir` | `DIR` / packaged path | Override helper-script directory. |
+|  | `--src-dir` | `DIR` / packaged path | Override Python source directory. |
+|  | `--skip-filter` | flag | Use the supplied BAM files without filtering. |
+|  | `--no-be-analysis` | flag | Skip BE analysis. |
+|  | `--no-se-analysis` | flag | Skip SE analysis. |
+|  | `--version` | flag | Print the version and exit. |
+| `-h` | `--help` | flag | Print help and exit. |
+
+At least one of BE or SE analysis must remain enabled.
+
+### BE and masking options
+
+| Short | Long | Value | Description |
+|---|---|---|---|
+| `-b` | `--bed-files` | `BED [BED ...]` | Mask one or more BED files from final results. |
+| `-a` | `--additional-bed-file` | `BED` | Split additional candidates into 50 bp windows and merge them with low-coverage candidates. |
+| `-g` | `--generate-ir` | flag | Run optional IR refinement with `genmap`; adds preprocessing and extra BE candidates. |
+
+### SE options
+
+| Long | Default | Description |
+|---|---:|---|
+| `--se-window-size BP` | `2000` | SE analysis window size. |
+| `--se-min-indel-length BP` | `50` | Minimum insertion/deletion length. |
+
+All numeric size, thread, process, and count options reject zero or negative
+values unless the option explicitly allows zero (for example, mpileup batch
+gap).
+
+## Helper programs
+
+Every helper supports `-h`/`--help` and `--version`. Existing long options and
+positional argument order are preserved for compatibility.
+
+| Program | Invocation | Purpose |
+|---|---|---|
+| `filter_bam.sh` | `MODE -i INPUT_BAM -o OUTPUT_BAM [OPTIONS]` | Filter short- or long-read alignments. |
+| `smallerror_short.sh` | `-i INPUT_BAM -o PREFIX [-t N]` | Generate low-coverage 50 bp candidates. |
+| `smallerror_long.py` | `BED BAM FASTA OUTPUT [OPTIONS]` | Evaluate candidates with long-read pileups. |
+| `merge_pileup.py` | `BED HIFI_DATA ONT_DATA FASTA OUTPUT` | Merge HiFi/ONT evidence and calculate sequence composition. |
+| `filter_be.py` | `DATA FAI [-o FILE] [-e] [-s SEP]` | Apply final BE rules; separators include `tab`, `comma`, `space`, and `pipe`. |
+| `spanning.py` | `BAM FAI -o PREFIX [-w BP] [-s BP] [-p N]` | Detect and merge non-spanning windows. |
+| `sas-se-analysis` | `BAM FASTA PREFIX [OPTIONS]` | Run SE analysis independently. |
+
+Examples:
+
+```bash
+bash scripts/filter_bam.sh long-read -i ont.bam -o ont.filtered.bam -t 16
+
+python scripts/smallerror_long.py candidates.bed hifi.bam reference.fa hifi.txt \
+  -p 16 -g 10000 -S 1000000 -n 1000
+
+sas-se-analysis ont.filtered.bam reference.fa sample \
+  -d se_results -w 2000 -m 50 -t 16 --workers 8
+```
+
+## Performance and implementation notes
+
+The standard workflow is the speed-oriented path: `-t/--threads` accelerates
+external tools, BE analysis limits long-read pileups to candidate regions, and
+SE spanning analysis avoids repeated random BAM queries. Heavy mpileup and SE
+tasks have separate conservative worker limits, preventing a high thread value
+from launching enough processes to saturate memory or random I/O. These changes
+reduce process-launch overhead, disk traffic, and redundant alignment scans on
+whole-genome datasets.
+
+### Batched mpileup
+
+`smallerror_long.py` does not start one `samtools mpileup` process per 50 bp
+candidate. It groups candidates on the same chromosome using these defaults:
+
+- maximum gap between adjacent candidates: 10 kb;
+- maximum complete batch span: 1 Mb;
+- maximum original intervals per batch: 1,000.
+
+Each batch uses both a genomic range and a BED target list. Pileup rows are then
+dispatched back to the original BED intervals, including overlapping intervals,
+without leaking positions from gaps between candidates. The 1 Mb and 1,000-row
+limits control only how many windows share one `mpileup` query; they never turn
+adjacent 50 bp windows into a longer analysis interval. Therefore a dense IR
+block may share a query for speed while every 50 bp window is still evaluated
+separately.
+
+For the pipeline-generated candidate sets, every row reaching this stage is at
+most 50 bp, so the 1 Mb batch-span limit is effective. In standalone use, an
+input BED row longer than 1 Mb remains one algorithmic interval and is not split
+silently; only additional rows are prevented from joining that batch.
+
+The batch output is written once to a shared spool with byte offsets for each
+window, then post-processed window by window. Final records are also staged once
+per batch and merged back into original BED order. This avoids creating two
+temporary files for every 50 bp candidate.
+
+### Bounded memory and file descriptors
+
+- indexed batch-result merging uses bounded fan-in and fixed memory;
+- HiFi/ONT evidence is joined through a temporary SQLite database instead of
+  loading all candidate and evidence rows into Python dictionaries;
+- reference composition uses a bounded 1 Mb sequential FASTA cache, avoiding
+  one indexed FASTA lookup for every dense 50 bp IR window;
+- final BE filtering reads the merged table in 100,000-row chunks and publishes
+  the result atomically;
+- complete command output is written to per-stage log files while only a bounded
+  diagnostic tail is retained by the pipeline process;
+- per-chromosome output writers use a bounded LRU file-handle pool;
+- SE window counters are stored sparsely and zero windows are synthesized only
+  when output is written.
+
+### BAM access
+
+Spanning analysis scans each chromosome once and evaluates its ordered windows
+in one pass. This avoids one random BAM fetch for every window while retaining
+the original full-span predicate.
+
+### Failure safety
+
+Intermediate data is written in private run directories. Related public outputs
+(for example FASTA/FAI pairs and paired spanning BED files) are published as a
+set with rollback, so a failed replacement does not leave mixed old/new files.
+
+Actual runtime depends on assembly size, coverage, storage latency, candidate
+count, and thread allocation. Optional IR refinement adds one `genmap` phase
+and extra candidate evaluation; the default BE + SE workflow skips that work
+and remains the recommended fast path for routine analysis.
+
+## Coordinate conventions
+
+- BED inputs and BED outputs use 0-based, half-open intervals.
+- SE `.tsv` window/anomaly coordinates are 1-based and closed.
+- Masking converts coordinate systems explicitly before overlap checks.
+
+## Configuration template
+
+[config/config_template.json](config/config_template.json) documents the
+configuration written to `metadata/pipeline_config.json`. The main program currently
+accepts command-line options; it does not load this JSON file as a CLI config.
+Standalone-only mpileup batch geometry options appear in `smallerror_long.py -h`
+rather than the configuration template.
+
+## Output files
+
+SAS separates compact deliverables from large intermediate files. For most
+downstream work, use only `final/`. The tree below is the **maximum possible
+successful-run output set**; disabled analyses and unused options omit their
+conditional files and directories.
+
+```text
 results/
-├── be_analysis/                      # BE (Base-level Errors) analysis results
-│   ├── final_be_results.txt         # Final BE candidates
-│   ├── smallerror.bed               # Initial error regions from short reads
-│   ├── hifi_filtered_regions.txt    # HiFi cross-validation results
-│   ├── ont_filtered_regions.txt     # ONT cross-validation results
-│   └── merged_results.txt           # Multi-technology consensus results
-├── se_analysis/                      # SE (Structural Errors) analysis results
-│   ├── se.anomalous_regions.bed           # All anomalous regions (BED)
-│   ├── se.anomalous_regions.tsv           # All anomalous regions (table)
-│   ├── se.anomaly_summary.tsv             # Per-chromosome anomaly summary
-│   ├── se.mosdepth.global.dist.txt        # Global depth distribution
-│   ├── se.mosdepth.region.dist.txt        # Per-region depth distribution
-│   ├── se.mosdepth.summary.txt            # Depth summary statistics
-│   ├── se.non_spanning.bed                # All 2kb non-spanning windows
-│   ├── se.non_spanning_regions.merged.bed # Merged non-spanning regions (BED)
-│   ├── se.regions.bed.gz                  # All 2kb windows (gzipped BED)
-│   ├── se.regions.bed.gz.csi              # Index for regions.bed.gz
-│   ├── se.result.bed                      # Merged anomalous regions (BED)
-│   └── se.window_stats.tsv                # Window-level statistics
-├── sas_pipeline_summary.txt         # Overall QV assessment and statistics
-├── pipeline_config.json             # Configuration backup
-└── sas_pipeline.log                 # Detailed execution log
++-- final/                                         # compact files to archive/share
+|   +-- sas_pipeline_summary.txt                   # genome-wide run/QV report
+|   +-- chromosome_qv_summary.txt                  # per-chromosome BE/SE/QV report
+|   +-- be/                                        # only when BE is enabled
+|   |   +-- final_be_results.txt                   # stable final BE table
+|   |   +-- IR.bed                                 # only with --generate-ir
+|   |   `-- by_chromosome/
+|   |       +-- be_results_chr1.txt                # one file per chromosome with BE rows
+|   |       +-- be_results_chr2.txt
+|   |       `-- be_results_<chromosome>.txt
+|   `-- se/                                        # only when SE is enabled
+|       +-- structural_errors.bed                  # merged final SE intervals
+|       +-- anomalous_regions.tsv                  # detailed final SE windows
+|       +-- anomaly_summary.tsv                    # SE tag counts by chromosome
+|       `-- by_chromosome/
+|           +-- se_results_chr1.txt                # one file per chromosome with SE rows
+|           +-- se_results_chr2.txt
+|           `-- se_results_<chromosome>.txt
+|
++-- work/                                          # intermediates and diagnostics
+|   +-- alignments/                                # omitted with --skip-filter
+|   |   +-- short_read_filtered.bam                 # only when BE is enabled
+|   |   +-- short_read_filtered.bam.bai             # only when BE is enabled
+|   |   +-- hifi_filtered.bam                       # only when BE is enabled
+|   |   +-- hifi_filtered.bam.bai                   # only when BE is enabled
+|   |   +-- ont_filtered.bam
+|   |   `-- ont_filtered.bam.bai
+|   |
+|   +-- be/                                        # only when BE is enabled
+|   |   +-- smallerror_short.genome                # chromosome sizes from BAM header
+|   |   +-- smallerror_short.windows.bed           # all 50 bp reference windows
+|   |   +-- smallerror_short.mosdepth.global.dist.txt
+|   |   +-- smallerror_short.mosdepth.summary.txt
+|   |   +-- smallerror_short.per-base.bed.gz       # short-read per-base depth
+|   |   +-- smallerror_short.per-base.bed.gz.csi   # mosdepth index, version-dependent
+|   |   +-- smallerror_short.low_coverage_bases.bed
+|   |   +-- smallerror_short.smallerror.bed        # helper's candidate BED
+|   |   +-- smallerror_short.smallerror.summary.txt
+|   |   +-- smallerror.bed                         # normalized pipeline candidate BED
+|   |   +-- smallerror_masked.bed                  # only with --bed-files
+|   |   +-- smallerror_50bp_windows.bed            # with -a or --generate-ir
+|   |   +-- additional_bed_windows.bed             # only with -a
+|   |   +-- ir_50bp_windows.bed                     # only with --generate-ir
+|   |   +-- candidate_50bp_windows.bed             # sorted/deduplicated; every row remains <=50 bp
+|   |   +-- candidate_50bp_windows.unmasked.bed    # extra candidates plus --bed-files only
+|   |   +-- hifi_filtered_regions.txt              # HiFi pileup evidence
+|   |   +-- ont_filtered_regions.txt               # ONT pileup evidence
+|   |   +-- merged_results.txt                     # merged HiFi/ONT evidence
+|   |   +-- final_be_results.unmasked.txt          # only with --bed-files
+|   |   `-- ir_generation/                         # --generate-ir private work root;
+|   |                                               # normally empty after run cleanup
+|   |
+|   `-- se/                                        # only when SE is enabled
+|       +-- structural_errors.regions.bed.gz       # 2 kb mosdepth regions
+|       +-- structural_errors.regions.bed.gz.csi   # mosdepth index, version-dependent
+|       +-- structural_errors.mosdepth.global.dist.txt
+|       +-- structural_errors.mosdepth.region.dist.txt
+|       +-- structural_errors.mosdepth.summary.txt
+|       +-- structural_errors.non_spanning.bed
+|       +-- structural_errors.non_spanning_regions.merged.bed
+|       +-- structural_errors.window_stats.tsv
+|       +-- structural_errors.anomalous_regions.tsv
+|       +-- structural_errors.anomalous_regions.bed
+|       +-- structural_errors.result.bed
+|       +-- structural_errors.anomaly_summary.tsv
+|       +-- se.regions.bed.gz                      # compatibility alias
+|       +-- se.regions.bed.gz.csi                  # compatibility alias, if present
+|       +-- se.mosdepth.global.dist.txt             # compatibility alias
+|       +-- se.mosdepth.region.dist.txt             # compatibility alias
+|       +-- se.mosdepth.summary.txt                 # compatibility alias
+|       +-- se.non_spanning.bed                     # compatibility alias
+|       +-- se.non_spanning_regions.merged.bed      # compatibility alias
+|       +-- se.window_stats.tsv                     # compatibility alias
+|       +-- se.anomalous_regions.tsv                # compatibility alias
+|       +-- se.anomalous_regions.bed                # compatibility alias
+|       +-- se.result.bed                           # compatibility alias
+|       +-- se.anomaly_summary.tsv                  # compatibility alias
+|       +-- se.anomalous_regions_masked.tsv         # only with --bed-files
+|       +-- structural_errors.result_masked.bed     # only with --bed-files
+|       `-- structural_errors.anomaly_summary_masked.tsv
+|                                                    # only with --bed-files
+|
++-- logs/
+|   +-- sas_pipeline.log                            # pipeline-level commands/diagnostics
+|   `-- stages/
+|       +-- 001_<stage>.stdout.log                  # complete stdout for each command
+|       +-- 001_<stage>.stderr.log                  # complete stderr for each command
+|       +-- 002_<stage>.stdout.log
+|       +-- 002_<stage>.stderr.log
+|       `-- ...                                     # one numbered pair per command
+|
+`-- metadata/
+    `-- pipeline_config.json                        # resolved run configuration
 ```
+
+Final filenames stay stable when BED masking is enabled; the files in `final/`
+contain the masked results. Detailed unmasked and diagnostic data remain under
+`work/`. The `se.*` entries are compatibility hard links (or symlinks when hard
+links are unavailable), so they normally do not duplicate the underlying file
+data. Mosdepth may add or omit compressed-file index files depending on its
+installed version.
+
+The `by_chromosome/` directories contain files only for chromosomes that have
+at least one result row. Therefore an error-free chromosome does not produce an
+empty `be_results_*` or `se_results_*` file.
+
+`work/` is intentionally not a public result interface: its filenames may
+change as the implementation evolves. Keep it when troubleshooting or when a
+full audit trail is required; otherwise `final/`, `logs/`, and `metadata/` are
+the useful deliverables. SAS does not delete files from the older flat layout
+when an existing output directory is reused, so use a new output directory to
+get a completely clean tree.
+
+## Testing
+
+Run the complete regression suite:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions runs the same suite on Python 3.8, 3.11, and 3.13 and builds the
+release artifacts on Python 3.11.
+
+Build and inspect release artifacts:
+
+```bash
+python -m pip install build
+python -m build
+```
+
+The tests cover CLI help/version output, batching and interval dispatch,
+streaming I/O, coordinate boundaries, empty inputs, cross-platform shell
+behavior, transactional publication, packaging, and installation layout.
 
 ## Citation
 
-If you use the SAS method in your research, please cite:
+If you use SAS, please cite:
 
-Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang, Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao, Yu Kang. Approaching an Error-Free Diploid Human Genome Assembly of East Asian Origin. bioRxiv. doi: https://doi.org/10.1101/2025.08.01.667781
+Yanan Chu, Zhuo Huang, Changjun Shao, Shuming Guo, Xinyao Yu, Jian Wang,
+Yabin Tian, Jing Chen, Ran Li, Yukun He, Jun Yu, Jie Huang, Zhancheng Gao and
+Yu Kang. *Approaching an Error-Free Diploid Human Genome Assembly of East Asian
+Origin*. bioRxiv. [https://doi.org/10.1101/2025.08.01.667781](https://doi.org/10.1101/2025.08.01.667781)
 
+## License
 
-
-
-
+This project is distributed under the [MIT License](LICENSE).
